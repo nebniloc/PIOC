@@ -2547,7 +2547,19 @@ fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a 
 }
 
 #[tauri::command]
-fn pioc_control_read(app: AppHandle, id: u64) -> Result<Option<serde_json::Value>, String> {
+fn pioc_control_read(
+    app: AppHandle,
+    state: State<'_, PtyState>,
+    id: u64,
+) -> Result<Option<serde_json::Value>, String> {
+    let session_is_live = state
+        .sessions
+        .lock()
+        .map_err(|_| "terminal session state is unavailable".to_string())?
+        .contains_key(&id);
+    if !session_is_live {
+        return Ok(None);
+    }
     let paths = pioc_control_paths(&app, id)?;
     if !paths.telemetry_path.exists() {
         return Ok(None);

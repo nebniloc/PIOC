@@ -684,6 +684,10 @@
     }
 
     async function startTerminal() {
+      status = statusLabel("starting");
+      activitySummary = statusLabel("starting");
+      piocControl = null;
+      piocControlError = "";
       nextTerminal = new WTerm(hostElement, {
         cols: 80,
         rows: 24,
@@ -749,10 +753,13 @@
         });
         unlistenError = await listen<PtyErrorPayload>("pty:error", (event) => {
           if (event.payload.id === id && !cancelled) {
+            const message = event.payload.error || statusLabel("unableToStart");
             ptyReady = false;
-            status = event.payload.error || statusLabel("unableToStart");
+            status = statusLabel("unableToStart");
             agentWorking = false;
-            activitySummary = status;
+            activitySummary = message;
+            piocControl = null;
+            piocControlError = kind === "pi" ? message : "";
             pendingTask = null;
           }
         });
@@ -785,7 +792,12 @@
           void invoke("pty_kill", { id });
         }
       } catch (error) {
-        status = error instanceof Error ? error.message : statusLabel("unableToStart");
+        const message = error instanceof Error ? error.message : String(error || statusLabel("unableToStart"));
+        status = statusLabel("unableToStart");
+        agentWorking = false;
+        activitySummary = message;
+        piocControl = null;
+        piocControlError = kind === "pi" ? message : "";
         nextTerminal?.destroy();
       }
     }
