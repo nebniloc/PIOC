@@ -29,6 +29,7 @@ const PROFILE_META_FILE: &str = "profile-meta.json";
 const PROFILE_SETTINGS_FILE: &str = "settings.json";
 const PROFILE_AUTH_FILE: &str = "auth.json";
 const PROFILE_SESSIONS_DIR: &str = "sessions";
+const PROFILE_RESOURCE_DIRS: &[&str] = &["skills", "extensions", "prompts", "themes"];
 const GLOBAL_PACKAGES_SETTINGS_KEY: &str = "globalPackages";
 const PROFILE_GENERATED_SETTINGS_KEYS: &[&str] = &[
     "defaultProvider",
@@ -138,6 +139,19 @@ struct PiAddonsMigrationResult {
     migrated_profiles: usize,
     migrated_packages: usize,
     copied_packages: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PiVanillaMigrationResult {
+    source_dir: String,
+    target_profile_id: String,
+    copied_resource_files: usize,
+    imported_packages: usize,
+    activated_packages: usize,
+    copied_packages: usize,
+    global_packages: usize,
+    updated_profile_settings: bool,
 }
 
 #[derive(Clone)]
@@ -314,6 +328,174 @@ fn profile_dir(app: &AppHandle, profile_id: &str) -> Result<PathBuf, String> {
     Ok(profiles_root(app)?.join(profile_id))
 }
 
+fn profile_resource_dir(
+    app: &AppHandle,
+    profile_id: &str,
+    resource_type: &str,
+) -> Result<PathBuf, String> {
+    let resource_type = resource_type.trim();
+    if !PROFILE_RESOURCE_DIRS.contains(&resource_type) {
+        return Err(
+            "unsupported Pi resource folder; use skills, extensions, prompts, or themes"
+                .to_string(),
+        );
+    }
+
+    Ok(profile_dir(app, profile_id)?.join(resource_type))
+}
+
+fn list_profile_resource_entries(
+    app: &AppHandle,
+    profile_id: &str,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    validate_profile_id(profile_id)?;
+    let profile_dir = profile_dir(app, profile_id)?;
+    let mut resources = HashMap::new();
+
+    for resource_type in PROFILE_RESOURCE_DIRS {
+        let resource_dir = profile_dir.join(resource_type);
+        let mut entries = Vec::new();
+
+        if resource_dir.exists() {
+            for entry in fs::read_dir(&resource_dir).map_err(|error| {
+                format!(
+                    "unable to list profile {resource_type} directory {}: {error}",
+                    resource_dir.display()
+                )
+            })? {
+                let entry = entry.map_err(|error| {
+                    format!("unable to read profile {resource_type} directory entry: {error}")
+                })?;
+                let path = entry.path();
+                if !path.is_dir()
+                    && path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .map(|extension| !extension.eq_ignore_ascii_case("md"))
+                        .unwrap_or(true)
+                {
+                    continue;
+                }
+
+                if let Some(name) = entry.file_name().to_str().map(str::to_string) {
+                    entries.push(name);
+                }
+            }
+        }
+
+        entries.sort_by_key(|entry| entry.to_lowercase());
+        resources.insert((*resource_type).to_string(), entries);
+    }
+
+    Ok(resources)
+}
+
+#[cfg(windows)]
+fn home_dir_from_env() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE")?;
+            let path = std::env::var_os("HOMEPATH")?;
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            (!home.as_os_str().is_empty()).then_some(home)
+        })
+}
+
+#[cfg(not(windows))]
+fn home_dir_from_env() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn configured_vanilla_agent_dir(variable_name: &str) -> Option<PathBuf> {
+    std::env::var_os(variable_name)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn default_vanilla_pi_agent_dir() -> Option<PathBuf> {
+    home_dir_from_env().map(|home| home.join(".pi").join("agent"))
+}
+
+fn absolutize_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map(|current_dir| current_dir.join(&path))
+            .unwrap_or(path)
+    }
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn validate_vanilla_pi_agent_dir(
+    app: &AppHandle,
+    path: PathBuf,
+    context: &str,
+) -> Result<PathBuf, String> {
+    let path = absolutize_path(path);
+    if !path.exists() {
+        return Err(format!(
+            "{context} does not exist: {}",
+            path.to_string_lossy()
+        ));
+    }
+    if !path.is_dir() {
+        return Err(format!(
+            "{context} is not a directory: {}",
+            path.to_string_lossy()
+        ));
+    }
+
+    let canonical_path = canonical_or_original(&path);
+    let canonical_app_data = canonical_or_original(&app_data_dir(app)?);
+    if canonical_path.starts_with(&canonical_app_data) {
+        return Err(format!(
+            "{context} points inside PIOC's managed data directory. Set PIOC_VANILLA_PI_AGENT_DIR to your vanilla Pi agent directory instead."
+        ));
+    }
+
+    let looks_like_pi_agent_dir = path.join(PROFILE_SETTINGS_FILE).exists()
+        || path.join(PROFILE_AUTH_FILE).exists()
+        || path.join("npm").exists()
+        || path.join("git").exists()
+        || PROFILE_RESOURCE_DIRS
+            .iter()
+            .any(|resource_dir| path.join(resource_dir).exists());
+    if !looks_like_pi_agent_dir {
+        return Err(format!(
+            "{context} does not look like a Pi agent directory: {}",
+            path.to_string_lossy()
+        ));
+    }
+
+    Ok(canonical_path)
+}
+
+fn resolve_vanilla_pi_agent_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Some(path) = configured_vanilla_agent_dir("PIOC_VANILLA_PI_AGENT_DIR") {
+        return validate_vanilla_pi_agent_dir(app, path, "PIOC_VANILLA_PI_AGENT_DIR");
+    }
+
+    if let Some(path) = configured_vanilla_agent_dir("PI_CODING_AGENT_DIR") {
+        if let Ok(path) = validate_vanilla_pi_agent_dir(app, path, "PI_CODING_AGENT_DIR") {
+            return Ok(path);
+        }
+    }
+
+    let default_dir = default_vanilla_pi_agent_dir().ok_or_else(|| {
+        "unable to resolve your home directory for the vanilla Pi agent".to_string()
+    })?;
+    validate_vanilla_pi_agent_dir(app, default_dir, "default vanilla Pi agent directory")
+}
+
 fn ensure_shared_auth(app: &AppHandle) -> Result<PathBuf, String> {
     let auth_path = shared_auth_path(app)?;
     if let Some(parent) = auth_path.parent() {
@@ -422,16 +604,14 @@ fn normalize_profile(mut profile: PiProfile) -> Result<PiProfile, String> {
 }
 
 fn ensure_profile_subdirectories(path: &Path) -> Result<(), String> {
-    for directory in [
-        "skills",
-        "extensions",
-        "prompts",
-        "themes",
-        PROFILE_SESSIONS_DIR,
-    ] {
+    for directory in PROFILE_RESOURCE_DIRS.iter().copied() {
         fs::create_dir_all(path.join(directory))
             .map_err(|error| format!("unable to create profile directory {directory}: {error}"))?;
     }
+
+    fs::create_dir_all(path.join(PROFILE_SESSIONS_DIR)).map_err(|error| {
+        format!("unable to create profile directory {PROFILE_SESSIONS_DIR}: {error}")
+    })?;
 
     Ok(())
 }
@@ -1351,6 +1531,39 @@ fn copy_path_recursive(from: &Path, to: &Path) -> Result<bool, String> {
     Ok(changed)
 }
 
+fn copy_path_recursive_changed_count(from: &Path, to: &Path) -> Result<usize, String> {
+    if !from.exists() {
+        return Ok(0);
+    }
+
+    if fs::canonicalize(from).ok() == fs::canonicalize(to).ok() {
+        return Ok(0);
+    }
+
+    if from.is_file() {
+        return copy_if_changed(from, to).map(usize::from);
+    }
+
+    if !from.is_dir() {
+        return Ok(0);
+    }
+
+    fs::create_dir_all(to)
+        .map_err(|error| format!("unable to create {}: {error}", to.display()))?;
+    let mut changed_files = 0;
+    for entry in
+        fs::read_dir(from).map_err(|error| format!("unable to list {}: {error}", from.display()))?
+    {
+        let entry =
+            entry.map_err(|error| format!("unable to read {} entry: {error}", from.display()))?;
+        let child_from = entry.path();
+        let child_to = to.join(entry.file_name());
+        changed_files += copy_path_recursive_changed_count(&child_from, &child_to)?;
+    }
+
+    Ok(changed_files)
+}
+
 fn migrate_local_profile_package(
     profile_id: &str,
     profile_dir: &Path,
@@ -1627,6 +1840,337 @@ fn rewrite_profile_settings_for_all_profiles(app: &AppHandle) -> Result<(), Stri
 
     Ok(())
 }
+
+fn merge_unique_strings(target: &mut Vec<String>, values: Vec<String>) -> bool {
+    let original = target.clone();
+    let mut next = normalize_list(target.clone());
+    let mut seen = next.iter().cloned().collect::<HashSet<_>>();
+
+    for value in values {
+        let value = value.trim().to_string();
+        if !value.is_empty() && seen.insert(value.clone()) {
+            next.push(value);
+        }
+    }
+
+    if original != next {
+        *target = next;
+        true
+    } else {
+        false
+    }
+}
+
+fn set_optional_string_if_missing(field: &mut Option<String>, value: Option<String>) -> bool {
+    if field.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+        return false;
+    }
+
+    if let Some(value) = value {
+        *field = Some(value);
+        true
+    } else {
+        false
+    }
+}
+
+fn set_optional_bool_if_missing(field: &mut Option<bool>, value: Option<bool>) -> bool {
+    if field.is_some() {
+        return false;
+    }
+
+    if let Some(value) = value {
+        *field = Some(value);
+        true
+    } else {
+        false
+    }
+}
+
+fn merge_missing_json_objects(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    source: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let mut changed = false;
+
+    for (key, value) in source {
+        match (target.get_mut(key), value) {
+            (
+                Some(serde_json::Value::Object(target_object)),
+                serde_json::Value::Object(source_object),
+            ) => {
+                changed |= merge_missing_json_objects(target_object, source_object);
+            }
+            (Some(_), _) => {}
+            (None, _) => {
+                target.insert(key.clone(), value.clone());
+                changed = true;
+            }
+        }
+    }
+
+    changed
+}
+
+fn migrate_resource_settings_to_profile(
+    vanilla_agent_dir: &Path,
+    values: Vec<String>,
+) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| {
+            let path = PathBuf::from(&value);
+            if path.is_absolute() && path.starts_with(vanilla_agent_dir) {
+                if let Ok(relative_path) = path.strip_prefix(vanilla_agent_dir) {
+                    if let Some(relative) = path_components_to_posix(relative_path) {
+                        return relative;
+                    }
+                }
+            }
+
+            value
+        })
+        .collect()
+}
+
+fn merge_vanilla_settings_into_profile(
+    profile: &mut PiProfile,
+    settings: &serde_json::Map<String, serde_json::Value>,
+    vanilla_agent_dir: &Path,
+) -> bool {
+    let mut changed = false;
+
+    changed |= set_optional_string_if_missing(
+        &mut profile.default_provider,
+        settings_string(settings, "defaultProvider"),
+    );
+    changed |= set_optional_string_if_missing(
+        &mut profile.default_model,
+        settings_string(settings, "defaultModel"),
+    );
+    changed |= set_optional_string_if_missing(
+        &mut profile.default_thinking_level,
+        settings_string(settings, "defaultThinkingLevel"),
+    );
+    changed |= set_optional_bool_if_missing(
+        &mut profile.hide_thinking_block,
+        settings_bool(settings, "hideThinkingBlock"),
+    );
+    changed |=
+        set_optional_string_if_missing(&mut profile.theme, settings_string(settings, "theme"));
+    changed |= set_optional_bool_if_missing(
+        &mut profile.quiet_startup,
+        settings_bool(settings, "quietStartup"),
+    );
+    changed |= set_optional_bool_if_missing(
+        &mut profile.collapse_changelog,
+        settings_bool(settings, "collapseChangelog"),
+    );
+    changed |= set_optional_bool_if_missing(
+        &mut profile.enable_install_telemetry,
+        settings_bool(settings, "enableInstallTelemetry"),
+    );
+    changed |= set_optional_string_if_missing(
+        &mut profile.double_escape_action,
+        settings_string(settings, "doubleEscapeAction"),
+    );
+    changed |= set_optional_string_if_missing(
+        &mut profile.tree_filter_mode,
+        settings_string(settings, "treeFilterMode"),
+    );
+    changed |= set_optional_string_if_missing(
+        &mut profile.steering_mode,
+        settings_string(settings, "steeringMode"),
+    );
+    changed |= set_optional_string_if_missing(
+        &mut profile.follow_up_mode,
+        settings_string(settings, "followUpMode"),
+    );
+    changed |= set_optional_string_if_missing(
+        &mut profile.transport,
+        settings_string(settings, "transport"),
+    );
+    changed |= set_optional_bool_if_missing(
+        &mut profile.show_hardware_cursor,
+        settings_bool(settings, "showHardwareCursor"),
+    );
+    changed |= set_optional_bool_if_missing(
+        &mut profile.enable_skill_commands,
+        settings_bool(settings, "enableSkillCommands"),
+    );
+
+    changed |= merge_unique_strings(
+        &mut profile.skills,
+        migrate_resource_settings_to_profile(
+            vanilla_agent_dir,
+            settings_string_list(settings, "skills").unwrap_or_default(),
+        ),
+    );
+    changed |= merge_unique_strings(
+        &mut profile.extensions,
+        migrate_resource_settings_to_profile(
+            vanilla_agent_dir,
+            settings_string_list(settings, "extensions").unwrap_or_default(),
+        ),
+    );
+    changed |= merge_unique_strings(
+        &mut profile.prompts,
+        migrate_resource_settings_to_profile(
+            vanilla_agent_dir,
+            settings_string_list(settings, "prompts").unwrap_or_default(),
+        ),
+    );
+    changed |= merge_unique_strings(
+        &mut profile.themes,
+        migrate_resource_settings_to_profile(
+            vanilla_agent_dir,
+            settings_string_list(settings, "themes").unwrap_or_default(),
+        ),
+    );
+
+    let mut extra_settings = extract_profile_extra_settings(settings);
+    extra_settings.remove(GLOBAL_PACKAGES_SETTINGS_KEY);
+    changed |= merge_missing_json_objects(&mut profile.extra_settings, &extra_settings);
+
+    changed
+}
+
+fn import_vanilla_pi_packages(
+    app: &AppHandle,
+    vanilla_agent_dir: &Path,
+    settings: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(usize, usize, usize, usize), String> {
+    let shared_addons_dir = shared_addons_dir(app)?;
+    fs::create_dir_all(&shared_addons_dir)
+        .map_err(|error| format!("unable to create shared Pi add-ons directory: {error}"))?;
+    fs::create_dir_all(shared_addons_dir.join(PROFILE_SESSIONS_DIR)).map_err(|error| {
+        format!("unable to create shared Pi add-ons session directory: {error}")
+    })?;
+
+    let mut shared_settings = read_profile_settings(&shared_addons_dir)?.unwrap_or_default();
+    let mut shared_sources =
+        normalize_package_source_list(settings_package_sources(&shared_settings));
+    let mut global_sources =
+        normalize_package_source_list(settings_global_package_sources(&shared_settings));
+    let mut shared_source_set = shared_sources.iter().cloned().collect::<HashSet<_>>();
+    let mut global_source_set = global_sources.iter().cloned().collect::<HashSet<_>>();
+    let mut imported_packages = 0;
+    let mut activated_packages = 0;
+    let mut copied_packages = 0;
+    let mut shared_settings_changed = false;
+
+    for package_entry in settings_package_sources(settings) {
+        let Some((source, copied)) = migrate_profile_package_entry(
+            "vanilla",
+            vanilla_agent_dir,
+            &shared_addons_dir,
+            &package_entry,
+        )?
+        else {
+            continue;
+        };
+
+        copied_packages += usize::from(copied);
+
+        if shared_source_set.insert(source.clone()) {
+            shared_sources.push(source.clone());
+            imported_packages += 1;
+            shared_settings_changed = true;
+        }
+
+        if global_source_set.insert(source.clone()) {
+            global_sources.push(source);
+            activated_packages += 1;
+            shared_settings_changed = true;
+        }
+    }
+
+    if shared_settings_changed {
+        shared_sources.sort_by_key(|source| source.to_lowercase());
+        global_sources.sort_by_key(|source| source.to_lowercase());
+        shared_settings.insert(
+            "packages".to_string(),
+            serde_json::to_value(&shared_sources)
+                .map_err(|error| format!("unable to serialize shared add-on packages: {error}"))?,
+        );
+        shared_settings.insert(
+            GLOBAL_PACKAGES_SETTINGS_KEY.to_string(),
+            serde_json::to_value(&global_sources)
+                .map_err(|error| format!("unable to serialize global Pi add-ons: {error}"))?,
+        );
+        write_settings_map(&shared_addons_dir, &shared_settings, "shared Pi add-ons")?;
+    }
+
+    Ok((
+        imported_packages,
+        activated_packages,
+        copied_packages,
+        global_sources.len(),
+    ))
+}
+
+fn migrate_vanilla_pi_agent(
+    app: &AppHandle,
+    target_profile_id: Option<String>,
+) -> Result<PiVanillaMigrationResult, String> {
+    let vanilla_agent_dir = resolve_vanilla_pi_agent_dir(app)?;
+    ensure_default_profile(app)?;
+
+    let target_profile_id = target_profile_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|profile_id| !profile_id.is_empty())
+        .unwrap_or(DEFAULT_PROFILE_ID)
+        .to_string();
+    validate_profile_id(&target_profile_id)?;
+
+    let target_profile_dir = profile_dir(app, &target_profile_id)?;
+    if !target_profile_dir.join(PROFILE_META_FILE).exists() {
+        return Err(format!(
+            "Pi profile '{target_profile_id}' does not exist; save the profile before importing vanilla Pi add-ons"
+        ));
+    }
+
+    fs::create_dir_all(&target_profile_dir)
+        .map_err(|error| format!("unable to create target profile directory: {error}"))?;
+    ensure_profile_subdirectories(&target_profile_dir)?;
+
+    let vanilla_settings = read_profile_settings(&vanilla_agent_dir)?.unwrap_or_default();
+    let mut copied_resource_files = 0;
+    for resource_type in PROFILE_RESOURCE_DIRS {
+        copied_resource_files += copy_path_recursive_changed_count(
+            &vanilla_agent_dir.join(resource_type),
+            &target_profile_dir.join(resource_type),
+        )?;
+    }
+
+    let mut profile = read_profile_files(&target_profile_dir)?;
+    let updated_profile_settings =
+        merge_vanilla_settings_into_profile(&mut profile, &vanilla_settings, &vanilla_agent_dir);
+    if updated_profile_settings {
+        profile.updated_at = now_string();
+        save_profile_files(app, profile)?;
+    }
+
+    let (imported_packages, activated_packages, copied_packages, global_packages) =
+        import_vanilla_pi_packages(app, &vanilla_agent_dir, &vanilla_settings)?;
+
+    if imported_packages > 0 || activated_packages > 0 || copied_packages > 0 {
+        rewrite_profile_settings_for_all_profiles(app)?;
+    }
+
+    Ok(PiVanillaMigrationResult {
+        source_dir: vanilla_agent_dir.to_string_lossy().to_string(),
+        target_profile_id,
+        copied_resource_files,
+        imported_packages,
+        activated_packages,
+        copied_packages,
+        global_packages,
+        updated_profile_settings,
+    })
+}
+
 fn settings_string(
     settings: &serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -2488,6 +3032,16 @@ async fn pi_addons_package_command(
 }
 
 #[tauri::command]
+async fn pi_vanilla_migrate(
+    app: AppHandle,
+    target_profile_id: Option<String>,
+) -> Result<PiVanillaMigrationResult, String> {
+    tauri::async_runtime::spawn_blocking(move || migrate_vanilla_pi_agent(&app, target_profile_id))
+        .await
+        .map_err(|error| format!("Vanilla Pi migration task failed: {error}"))?
+}
+
+#[tauri::command]
 fn pi_profiles_list(app: AppHandle) -> Result<Vec<PiProfile>, String> {
     migrate_profile_packages_to_shared_addons(&app)?;
     list_profiles_from_disk(&app)
@@ -2536,6 +3090,33 @@ fn pi_profile_reveal_dir(app: AppHandle, profile_id: String) -> Result<String, S
         .open_path(path.clone(), None::<String>)
         .map_err(|error| format!("unable to open profile directory: {error}"))?;
     Ok(path)
+}
+
+#[tauri::command]
+fn pi_profile_reveal_resource_dir(
+    app: AppHandle,
+    profile_id: String,
+    resource_type: String,
+) -> Result<String, String> {
+    let profile_id = profile_id.trim().to_string();
+    validate_profile_id(&profile_id)?;
+    let dir = profile_resource_dir(&app, &profile_id, &resource_type)?;
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("unable to create profile resource directory: {error}"))?;
+    let path = dir.to_string_lossy().to_string();
+    app.opener()
+        .open_path(path.clone(), None::<String>)
+        .map_err(|error| format!("unable to open profile resource directory: {error}"))?;
+    Ok(path)
+}
+
+#[tauri::command]
+fn pi_profile_resources_list(
+    app: AppHandle,
+    profile_id: String,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    let profile_id = profile_id.trim().to_string();
+    list_profile_resource_entries(&app, &profile_id)
 }
 
 fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -2949,9 +3530,12 @@ pub fn run() {
             pi_profile_save,
             pi_profile_delete,
             pi_profile_reveal_dir,
+            pi_profile_reveal_resource_dir,
+            pi_profile_resources_list,
             pi_addons_list,
             pi_addons_package_command,
             pi_addons_set_global_packages,
+            pi_vanilla_migrate,
             pioc_control_read,
             pioc_control_command,
             pty_start,

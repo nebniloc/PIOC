@@ -429,10 +429,17 @@
       if (charWidth <= 0 || rowHeight <= 0) return null;
 
       const availableElement = viewportElement ?? hostElement;
+      const hostStyles = getComputedStyle(hostElement);
+      const horizontalPadding =
+        (Number.parseFloat(hostStyles.paddingLeft) || 0) + (Number.parseFloat(hostStyles.paddingRight) || 0);
+      const verticalPadding =
+        (Number.parseFloat(hostStyles.paddingTop) || 0) + (Number.parseFloat(hostStyles.paddingBottom) || 0);
+      const availableWidth = Math.max(0, availableElement.clientWidth - horizontalPadding);
+      const availableHeight = Math.max(0, availableElement.clientHeight - verticalPadding);
 
       return {
-        cols: Math.max(1, Math.floor(availableElement.clientWidth / charWidth)),
-        rows: Math.max(1, Math.floor(availableElement.clientHeight / rowHeight)),
+        cols: Math.max(1, Math.floor(availableWidth / charWidth)),
+        rows: Math.max(1, Math.floor(availableHeight / rowHeight)),
       };
     }
 
@@ -986,6 +993,18 @@
     height: auto !important;
     min-height: 100%;
     overflow: visible !important;
+  }
+  /*
+   * @wterm/dom propagates the last cell background to the entire row/grid when
+   * a line exactly fills the terminal. Pi's input draws its cursor as a
+   * reverse-video cell, so when that cell lands in the final column the whole
+   * input row turns white. Keep cell-level backgrounds, but suppress the
+   * renderer's row/grid-wide background propagation.
+   */
+  :global(.terminal-host .term-grid),
+  :global(.terminal-host .term-row) {
+    background: transparent !important;
+    box-shadow: none !important;
   }
 
   :global(.terminal-host .term-row.pioc-terminal-footer-row-hidden) {

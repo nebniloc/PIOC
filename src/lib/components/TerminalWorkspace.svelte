@@ -62,6 +62,28 @@
     global: boolean;
   };
 
+  type PiVanillaMigrationResult = {
+    sourceDir: string;
+    targetProfileId: string;
+    copiedResourceFiles: number;
+    importedPackages: number;
+    activatedPackages: number;
+    copiedPackages: number;
+    globalPackages: number;
+    updatedProfileSettings: boolean;
+  };
+
+  type PiProfileResourceType = "skills" | "extensions" | "prompts" | "themes";
+
+  type PiProfileResourceFolder = {
+    type: PiProfileResourceType;
+    label: string;
+    description: string;
+    buttonLabel: string;
+  };
+
+  type PiProfileResources = Record<PiProfileResourceType, string[]>;
+
   type TerminalSession = {
     id: number;
     cached: boolean;
@@ -104,6 +126,41 @@
     "dark:bg-input/30 border-input focus-visible:border-ring focus-visible:ring-ring/50 aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:border-destructive dark:aria-invalid:border-destructive/50 disabled:bg-input/50 dark:disabled:bg-input/80 min-h-28 w-full min-w-0 resize-y rounded-none border bg-transparent px-2.5 py-2 font-mono text-xs transition-colors focus-visible:ring-1 aria-invalid:ring-1 outline-none placeholder:text-muted-foreground disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50";
   const PROFILE_EXTRA_SETTINGS_PLACEHOLDER =
     '{\n  "terminal": { "showImages": true },\n  "compaction": { "enabled": true }\n}';
+  const PROFILE_RESOURCE_FOLDERS: PiProfileResourceFolder[] = [
+    {
+      type: "skills",
+      label: "Skills",
+      description: "Drop SKILL.md folders or root .md skill files for this Pi instance.",
+      buttonLabel: "Open skills folder",
+    },
+    {
+      type: "extensions",
+      label: "Extensions",
+      description: "Drop .ts files or extension folders with index.ts for this Pi instance.",
+      buttonLabel: "Open extensions folder",
+    },
+    {
+      type: "prompts",
+      label: "Prompts",
+      description: "Drop .md prompt templates that become slash commands for this Pi instance.",
+      buttonLabel: "Open prompts folder",
+    },
+    {
+      type: "themes",
+      label: "Themes",
+      description: "Drop .json TUI theme files that only this Pi instance should load.",
+      buttonLabel: "Open themes folder",
+    },
+  ];
+
+  function emptyProfileResources(): PiProfileResources {
+    return {
+      skills: [],
+      extensions: [],
+      prompts: [],
+      themes: [],
+    };
+  }
   let {
     onHotkeysChange,
   }: {
@@ -156,7 +213,13 @@
   let profilePromptsDraft = $state("");
   let profileThemesDraft = $state("");
   let profilePackageCommandOutput = $state("");
+  let profileManualFolderMessage = $state("");
+  let profileResourceFolderOpening = $state<PiProfileResourceType | null>(null);
+  let profileResources = $state<PiProfileResources>(emptyProfileResources());
+  let profileResourcesLoading = $state(false);
   let profilePackageCommandRunning = $state(false);
+  let piVanillaMigrationRunning = $state(false);
+  let piAddonBusy = $derived(profilePackageCommandRunning || piAddonGlobalSaving || piVanillaMigrationRunning);
   let skillAddonPackages = $derived(piAddonPackages.filter((addonPackage) => addonPackage.resourceTypes.includes("skills")));
   let extensionAddonPackages = $derived(piAddonPackages.filter((addonPackage) => addonPackage.resourceTypes.includes("extensions")));
   let promptAddonPackages = $derived(piAddonPackages.filter((addonPackage) => addonPackage.resourceTypes.includes("prompts")));
@@ -583,6 +646,8 @@
   }
 
   function toggleProfilePackageSelection(source: string) {
+    if (piAddonBusy) return;
+
     profileSelectedPackageSources = profilePackageSelected(source)
       ? profileSelectedPackageSources.filter((selectedSource) => selectedSource !== source)
       : [...profileSelectedPackageSources, source];
@@ -597,7 +662,7 @@
   }
 
   async function toggleGlobalPackageSelection(source: string) {
-    if (piAddonGlobalSaving || profilePackageCommandRunning) return;
+    if (piAddonBusy) return;
 
     const previousPackages = piAddonPackages;
     const nextPackages = piAddonPackages.map((addonPackage) =>
@@ -775,15 +840,45 @@
     spawnTerminal(launchProfileId, true);
     launchProfileDialogOpen = false;
   }
+  async function loadProfileResources(profileId = selectedProfileId) {
+    const normalizedProfileId = normalizeProfileId(profileId);
+    if (!normalizedProfileId) {
+      profileResources = emptyProfileResources();
+      return;
+    }
+
+    profileResourcesLoading = true;
+    try {
+      const resources = await invoke<PiProfileResources>("pi_profile_resources_list", {
+        profileId: normalizedProfileId,
+      });
+      if (samePiProfile(selectedProfileId, normalizedProfileId)) {
+        profileResources = { ...emptyProfileResources(), ...resources };
+      }
+    } catch (error) {
+      if (samePiProfile(selectedProfileId, normalizedProfileId)) {
+        profileResources = emptyProfileResources();
+        profileError = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      if (samePiProfile(selectedProfileId, normalizedProfileId)) {
+        profileResourcesLoading = false;
+      }
+    }
+  }
+
   function populateProfileDraft(profile?: PiProfile | null, resetPackageCommand = true) {
     const profileToEdit = profile ?? profileById(selectedProfileId) ?? piProfiles[0];
 
     if (resetPackageCommand) {
       profilePackageCommandOutput = "";
+      profileManualFolderMessage = "";
     }
 
     if (!profileToEdit) {
       selectedProfileId = "";
+      profileResources = emptyProfileResources();
+      profileResourcesLoading = false;
       profileNameDraft = "";
       profileDescriptionDraft = "";
       profileProviderDraft = "";
@@ -810,12 +905,16 @@
     profileExtensionsDraft = joinProfileList(profileToEdit.extensions);
     profilePromptsDraft = joinProfileList(profileToEdit.prompts);
     profileThemesDraft = joinProfileList(profileToEdit.themes);
+    void loadProfileResources(profileToEdit.id);
   }
 
   function newProfileDraft() {
     selectedProfileId = "";
     profileError = "";
     profilePackageCommandOutput = "";
+    profileManualFolderMessage = "";
+    profileResources = emptyProfileResources();
+    profileResourcesLoading = false;
     profileNameDraft = "New Pi Profile";
     profileDescriptionDraft = "";
     profileProviderDraft = "";
@@ -942,10 +1041,31 @@
     if (!selectedProfileId) return;
 
     try {
-      await invoke<string>("pi_profile_reveal_dir", { profileId: selectedProfileId });
+      const path = await invoke<string>("pi_profile_reveal_dir", { profileId: selectedProfileId });
+      profileManualFolderMessage = `Opened profile folder: ${path}`;
       profileError = "";
     } catch (error) {
       profileError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  async function revealSelectedProfileResourceDir(resourceType: PiProfileResourceType) {
+    if (!selectedProfileId || profileResourceFolderOpening) return;
+
+    profileResourceFolderOpening = resourceType;
+    profileManualFolderMessage = "";
+    profileError = "";
+
+    try {
+      const path = await invoke<string>("pi_profile_reveal_resource_dir", {
+        profileId: selectedProfileId,
+        resourceType,
+      });
+      profileManualFolderMessage = `Opened ${resourceType} folder: ${path}`;
+    } catch (error) {
+      profileError = error instanceof Error ? error.message : String(error);
+    } finally {
+      profileResourceFolderOpening = null;
     }
   }
 
@@ -955,9 +1075,52 @@
     return outputText || `Command completed with exit code ${output.code ?? 0}.`;
   }
 
+  function vanillaPiMigrationText(result: PiVanillaMigrationResult) {
+    const parts = [
+      `Imported vanilla Pi from ${result.sourceDir}.`,
+      `${pluralize(result.copiedResourceFiles, "manual resource file")} copied or updated.`,
+      `${pluralize(result.importedPackages, "shared add-on package")} imported.`,
+      `${pluralize(result.activatedPackages, "package")} marked always active.`,
+      `${pluralize(result.copiedPackages, "installed package tree")} copied.`,
+      `${pluralize(result.globalPackages, "shared add-on")} now always active.`,
+    ];
+
+    if (result.updatedProfileSettings) {
+      parts.push("Merged vanilla Pi settings into the selected profile without overwriting existing values.");
+    }
+
+    return parts.join("\n");
+  }
+
+  async function migrateVanillaPiAddons() {
+    if (piAddonBusy) return;
+
+    profileError = "";
+    profileManualFolderMessage = "";
+    profilePackageCommandOutput = "Migrating vanilla Pi add-ons…\nFirst import can take a minute while PIOC copies your vanilla Pi npm add-on cache.";
+    piVanillaMigrationRunning = true;
+
+    await tick();
+    try {
+      const result = await invoke<PiVanillaMigrationResult>("pi_vanilla_migrate", {
+        targetProfileId: selectedProfileId || DEFAULT_PI_PROFILE_ID,
+      });
+      await loadPiProfiles();
+      await loadPiAddons();
+      populateProfileDraft(profileById(result.targetProfileId) ?? profileById(favoritePiProfileId) ?? piProfiles[0], false);
+      profilePackageCommandOutput = vanillaPiMigrationText(result);
+    } catch (error) {
+      profileError = error instanceof Error ? error.message : String(error);
+      profilePackageCommandOutput = "";
+    } finally {
+      piVanillaMigrationRunning = false;
+    }
+  }
+
   function openInstallAddonCommandPalette() {
     profileError = "";
     profilePackageCommandOutput = "";
+    profileManualFolderMessage = "";
     profileDialogOpen = false;
     commandPaletteOpen = true;
   }
@@ -968,6 +1131,7 @@
 
     profileError = "";
     profilePackageCommandOutput = "";
+    profileManualFolderMessage = "";
     await loadPiAddons();
     populateProfileDraft(profileById(favoritePiProfileId) ?? piProfiles[0], false);
     profileDialogOpen = true;
@@ -975,6 +1139,7 @@
     await runProfilePackageCommand("install", packageSource);
   }
   async function runProfilePackageCommand(command: "install" | "remove" | "update" | "list", source?: string): Promise<boolean> {
+    if (piAddonBusy) return false;
     const packageSource = source?.trim() ?? "";
     if ((command === "install" || command === "remove") && !packageSource) {
       profileError = "Package source is required.";
@@ -1904,7 +2069,7 @@
               <div class="flex min-w-0 flex-col gap-1">
                 <h3 class="font-medium text-foreground">Profile add-ons</h3>
                 <p class="text-muted-foreground">
-                  Paste a Pi install command or package source into the command palette, then choose profile-specific add-ons or mark shared add-ons as always active for every profile.
+                  Paste a Pi install command or package source into the command palette, import your vanilla Pi add-ons into the selected profile, then choose profile-specific add-ons or mark shared add-ons as always active for every profile.
                 </p>
                 <p class="text-muted-foreground">{piAddonPackages.length} installed · {profileSelectedPackageSources.length} profile selected · {globalAddonCount(piAddonPackages)} always active</p>
               </div>
@@ -1913,7 +2078,7 @@
                   variant="outline"
                   size="sm"
                   type="button"
-                  disabled={profilePackageCommandRunning || piAddonGlobalSaving}
+                  disabled={piAddonBusy}
                   onclick={openInstallAddonCommandPalette}
                 >
                   Install…
@@ -1922,7 +2087,16 @@
                   variant="outline"
                   size="sm"
                   type="button"
-                  disabled={profilePackageCommandRunning || piAddonGlobalSaving || piAddonPackages.length === 0}
+                  disabled={piAddonBusy || !selectedProfileId}
+                  onclick={() => void migrateVanillaPiAddons()}
+                >
+                  {piVanillaMigrationRunning ? "Importing…" : "Import into selected profile"}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  type="button"
+                  disabled={piAddonBusy || piAddonPackages.length === 0}
                   onclick={() => void runProfilePackageCommand("update")}
                 >
                   Update all
@@ -1931,7 +2105,7 @@
                   variant="ghost"
                   size="sm"
                   type="button"
-                  disabled={profilePackageCommandRunning || piAddonGlobalSaving}
+                  disabled={piAddonBusy}
                   onclick={() => void loadPiAddons()}
                 >
                   Refresh
@@ -1939,13 +2113,71 @@
               </div>
             </div>
 
-            {#if profilePackageCommandRunning || piAddonGlobalSaving}
-              <p class="text-muted-foreground">{piAddonGlobalSaving ? "Saving global Pi add-ons…" : "Running shared Pi add-on command…"}</p>
+            {#if piAddonBusy}
+              <p class="text-muted-foreground">
+                {piVanillaMigrationRunning
+                  ? "Migrating vanilla Pi add-ons… first import can take a minute while PIOC copies your vanilla Pi npm add-on cache."
+                  : piAddonGlobalSaving
+                    ? "Saving global Pi add-ons…"
+                    : "Running shared Pi add-on command…"}
+              </p>
             {/if}
 
             {#if profilePackageCommandOutput}
               <pre class="max-h-32 overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">{profilePackageCommandOutput}</pre>
             {/if}
+
+            <div class="flex flex-col gap-3 rounded-md border border-border bg-background/60 p-3">
+              <div class="flex flex-col gap-1">
+                <p class="font-medium text-foreground">Manual profile folders</p>
+                <p class="text-muted-foreground">
+                  Drop custom files here when they cannot be installed with Pi. New Pi sessions load these folders automatically; use /reload in an open session after adding files.
+                </p>
+              </div>
+
+              {#if profileManualFolderMessage}
+                <p class="rounded-md border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">{profileManualFolderMessage}</p>
+              {/if}
+
+              <div class="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+                {#each PROFILE_RESOURCE_FOLDERS as folder (folder.type)}
+                  <div class="flex min-w-0 flex-col gap-2 rounded-md border border-border bg-muted/40 p-3">
+                    <span class="flex min-w-0 flex-col gap-1">
+                      <span class="font-medium text-foreground">{folder.label}</span>
+                      <span class="text-xs text-muted-foreground">{folder.description}</span>
+                    </span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      type="button"
+                      disabled={!selectedProfileId || profileResourceFolderOpening !== null}
+                      onclick={() => void revealSelectedProfileResourceDir(folder.type)}
+                    >
+                      {profileResourceFolderOpening === folder.type ? "Opening…" : folder.buttonLabel}
+                    </Button>
+
+                    {#if profileResourcesLoading && selectedProfileId}
+                      <span class="text-xs text-muted-foreground">Checking installed {folder.label.toLowerCase()}…</span>
+                    {:else if profileResources[folder.type]?.length}
+                      <span class="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">
+                        <span>{profileResources[folder.type].length} installed:</span>
+                        <span class="flex flex-wrap gap-1">
+                          {#each profileResources[folder.type] as resourceName (resourceName)}
+                            <span class="max-w-full truncate rounded border border-border bg-background px-1.5 py-0.5 text-foreground">{resourceName}</span>
+                          {/each}
+                        </span>
+                      </span>
+                    {:else if selectedProfileId}
+                      <span class="text-xs text-muted-foreground">No manual {folder.label.toLowerCase()} in this profile.</span>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+
+              {#if !selectedProfileId}
+                <p class="text-xs text-muted-foreground">Save the profile before opening its custom resource folders.</p>
+              {/if}
+            </div>
 
             <div class="flex flex-col gap-3">
               <div class="flex flex-col gap-3 rounded-md border border-border bg-background/60 p-3">
@@ -2212,7 +2444,7 @@
 
         <Dialog.Footer class="border-t border-border pt-3 sm:justify-between">
           <div class="flex gap-2">
-            <Button variant="outline" type="button" disabled={!selectedProfileId} onclick={revealSelectedProfileDir}>Open folder</Button>
+            <Button variant="outline" type="button" disabled={!selectedProfileId} onclick={revealSelectedProfileDir}>Open profile folder</Button>
             <Button
               variant="destructive"
               type="button"
@@ -2222,7 +2454,7 @@
               Delete
             </Button>
           </div>
-          <Button variant="ghost" type="submit" disabled={!profileNameDraft.trim() || profilePackageCommandRunning || piAddonGlobalSaving}>Save profile</Button>
+          <Button variant="ghost" type="submit" disabled={!profileNameDraft.trim() || piAddonBusy}>Save profile</Button>
         </Dialog.Footer>
       </form>
     </div>
