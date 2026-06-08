@@ -17,5 +17,11 @@
   },
   "bundle": {
     "createUpdaterArtifacts": false
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dev-updater-disabled",
+      "endpoints": []
+    }
   }
 }
