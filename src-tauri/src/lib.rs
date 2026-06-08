@@ -1615,7 +1615,7 @@ fn list_shared_addon_packages(app: &AppHandle) -> Result<Vec<PiAddonPackage>, St
         })
         .collect::<Vec<_>>();
 
-    packages.sort_by(|left, right| left.source.to_lowercase().cmp(&right.source.to_lowercase()));
+    packages.sort_by_key(|package| package.source.to_lowercase());
     Ok(packages)
 }
 
@@ -1795,7 +1795,7 @@ fn list_profiles_from_disk(app: &AppHandle) -> Result<Vec<PiProfile>, String> {
         profiles.push(profile);
     }
 
-    profiles.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    profiles.sort_by_key(|profile| profile.name.to_lowercase());
     Ok(profiles)
 }
 
