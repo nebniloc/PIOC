@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "PIOC Dev",
+  "identifier": "com.pioc.app.dev",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build:dev"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "PIOC Dev",
+        "width": 800,
+        "height": 600
+      }
+    ]
+  },
+  "bundle": {
+    "createUpdaterArtifacts": false
+  }
+}
