@@ -6,6 +6,10 @@ on:
     tags:
       - "pioc-v*"
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
@@ -22,24 +26,33 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.10.0
+          run_install: false
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Enable pnpm
-        run: corepack enable pnpm
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - name: Install frontend dependencies
-        run: pnpm install --frozen-lockfile
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
 
-      - name: Run quality gates
-        run: pnpm run ci
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+      - name: Verify release version
+        run: pnpm run version:check
 
       - name: Prepare production Tauri config
         run: pnpm run prepare:prod-config
@@ -48,7 +61,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         with:
           tauriScript: pnpm tauri
-          args: --config src-tauri/tauri.prod.generated.conf.json
+          args: --config src-tauri/tauri.prod.generated.conf.json --bundles nsis
           tagName: pioc-v__VERSION__
           releaseName: PIOC v__VERSION__
           releaseBody: See the assets below to install PIOC. Production builds can update themselves from this release.

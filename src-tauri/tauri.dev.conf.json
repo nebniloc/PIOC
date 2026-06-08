@@ -16,6 +16,7 @@
     ]
   },
   "bundle": {
+    "targets": ["nsis"],
     "createUpdaterArtifacts": false
   },
   "plugins": {

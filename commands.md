@@ -26,7 +26,8 @@ pnpm run check          # Svelte check
 pnpm run typecheck      # TypeScript check
 pnpm run test           # JS + Rust tests
 pnpm run lint           # Rust fmt check + clippy
-pnpm run ci             # full local quality gate
+pnpm run ci:fast        # faster local checks for iteration
+pnpm run ci             # full local quality gate before release
 ```
 
 ## Frontend-only commands
@@ -44,18 +45,18 @@ pnpm run preview        # preview built frontend
 pnpm run app:build:dev
 ```
 
-Builds the isolated `PIOC Dev` desktop app.
+Builds the isolated `PIOC Dev` desktop app. Windows builds create the NSIS installer only for faster packaging.
 
 ```bash
 pnpm run app:build:prod
 ```
 
-Builds the signed production app. This requires updater signing configuration.
+Builds the signed production app. This requires updater signing configuration. Windows builds create the NSIS installer only because that is what the updater uses.
 
 ## Normal change workflow
 
 ```bash
-pnpm run ci
+pnpm run ci:fast
 git add .
 git commit -m "your message"
 git push
@@ -77,9 +78,10 @@ git push
    pnpm run version:check
    ```
 
-3. Run the full quality gate:
+3. Run checks. Use `ci:fast` while iterating, then `ci` before tagging if you did not already get a green GitHub CI run:
 
    ```bash
+   pnpm run ci:fast
    pnpm run ci
    ```
 
@@ -87,18 +89,18 @@ git push
 
    ```bash
    git add .
-   git commit -m "Release v0.1.1"
+   git commit -m "Release vX.Y.Z"
    git push origin main
    ```
 
 5. Tag and push the release tag:
 
    ```bash
-   git tag pioc-v0.1.1
-   git push origin pioc-v0.1.1
+   git tag pioc-vX.Y.Z
+   git push origin pioc-vX.Y.Z
    ```
 
-GitHub Actions will build and publish the signed production installer, signatures, and `latest.json` updater manifest.
+GitHub Actions will build and publish the signed production NSIS installer, signature, and `latest.json` updater manifest. Tag pushes do not run the separate CI workflow.
 
 ## Updater signing setup
 
