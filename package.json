@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.2",
   "type": "module",
-  "packageManager": "pnpm@10.10.0",
+  "packageManager": "pnpm@11.5.2",
   "scripts": {
     "dev": "vite --mode development",
     "build": "pnpm run build:prod",
@@ -38,6 +38,7 @@
     "@tauri-apps/plugin-updater": "^2.10.1",
     "@wterm/dom": "^0.3.0",
     "svelte-dnd-action": "^0.9.69",
+    "three": "^0.184.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
@@ -46,6 +47,7 @@
     "@sveltejs/vite-plugin-svelte": "^7.1.2",
     "@tailwindcss/vite": "^4.3.0",
     "@tauri-apps/cli": "^2",
+    "@types/three": "^0.184.1",
     "bits-ui": "^2.18.1",
     "clsx": "^2.1.1",
     "remixicon-svelte": "^0.0.5",

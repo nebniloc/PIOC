@@ -10,7 +10,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child as StdChild, Command as StdCommand, Output, Stdio},
-    sync::Mutex,
+    sync::{Condvar, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -57,6 +57,7 @@ const PROFILE_GENERATED_SETTINGS_KEYS: &[&str] = &[
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const PI_PACKAGE_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PI_PACKAGE_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const PI_STARTUP_UPDATE_LOCK_FILE: &str = "pi-startup-update.lock";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -191,10 +192,20 @@ struct PtyStartRequest {
     pi_profile_id: Option<String>,
 }
 
+#[derive(Clone, Default)]
+enum PiStartupUpdateStatus {
+    #[default]
+    NotStarted,
+    Running,
+    Complete(Result<(), String>),
+}
+
 #[derive(Default)]
 struct PtyState {
     sessions: Mutex<HashMap<u64, PtySession>>,
     running_pi_profiles: Mutex<HashMap<String, u64>>,
+    startup_pi_update: Mutex<PiStartupUpdateStatus>,
+    startup_pi_update_changed: Condvar,
 }
 
 impl Drop for PtyState {
@@ -344,6 +355,21 @@ fn profile_resource_dir(
     Ok(profile_dir(app, profile_id)?.join(resource_type))
 }
 
+fn is_supported_resource_file(resource_type: &str, path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return false;
+    };
+
+    match resource_type {
+        "skills" | "prompts" => extension.eq_ignore_ascii_case("md"),
+        "extensions" => {
+            extension.eq_ignore_ascii_case("ts") || extension.eq_ignore_ascii_case("js")
+        }
+        "themes" => extension.eq_ignore_ascii_case("json"),
+        _ => false,
+    }
+}
+
 fn list_profile_resource_entries(
     app: &AppHandle,
     profile_id: &str,
@@ -367,13 +393,7 @@ fn list_profile_resource_entries(
                     format!("unable to read profile {resource_type} directory entry: {error}")
                 })?;
                 let path = entry.path();
-                if !path.is_dir()
-                    && path
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .map(|extension| !extension.eq_ignore_ascii_case("md"))
-                        .unwrap_or(true)
-                {
+                if !path.is_dir() && !is_supported_resource_file(resource_type, &path) {
                     continue;
                 }
 
@@ -1777,6 +1797,14 @@ fn migrate_profile_packages_to_shared_addons(
 
 fn package_resource_types(package_path: &Path) -> Vec<String> {
     let mut resource_types = Vec::new();
+
+    if package_path.is_file() {
+        if is_supported_resource_file("extensions", package_path) {
+            resource_types.push("extensions".to_string());
+        }
+        return resource_types;
+    }
+
     let package_json_path = package_path.join("package.json");
     let pi_manifest = fs::read_to_string(&package_json_path)
         .ok()
@@ -2035,18 +2063,34 @@ fn merge_vanilla_settings_into_profile(
     changed
 }
 
-fn import_vanilla_pi_packages(
-    app: &AppHandle,
-    vanilla_agent_dir: &Path,
-    settings: &serde_json::Map<String, serde_json::Value>,
-) -> Result<(usize, usize, usize, usize), String> {
+struct SharedAddonUpdateResult {
+    imported_packages: usize,
+    activated_packages: usize,
+    global_packages: usize,
+}
+
+struct VanillaResourceImportResult {
+    copied_files: usize,
+    imported_packages: usize,
+    activated_packages: usize,
+}
+
+fn ensure_shared_addons_dirs(app: &AppHandle) -> Result<PathBuf, String> {
     let shared_addons_dir = shared_addons_dir(app)?;
     fs::create_dir_all(&shared_addons_dir)
         .map_err(|error| format!("unable to create shared Pi add-ons directory: {error}"))?;
     fs::create_dir_all(shared_addons_dir.join(PROFILE_SESSIONS_DIR)).map_err(|error| {
         format!("unable to create shared Pi add-ons session directory: {error}")
     })?;
+    Ok(shared_addons_dir)
+}
 
+fn update_shared_addon_settings(
+    app: &AppHandle,
+    sources: Vec<String>,
+    activate: bool,
+) -> Result<SharedAddonUpdateResult, String> {
+    let shared_addons_dir = ensure_shared_addons_dirs(app)?;
     let mut shared_settings = read_profile_settings(&shared_addons_dir)?.unwrap_or_default();
     let mut shared_sources =
         normalize_package_source_list(settings_package_sources(&shared_settings));
@@ -2056,29 +2100,16 @@ fn import_vanilla_pi_packages(
     let mut global_source_set = global_sources.iter().cloned().collect::<HashSet<_>>();
     let mut imported_packages = 0;
     let mut activated_packages = 0;
-    let mut copied_packages = 0;
     let mut shared_settings_changed = false;
 
-    for package_entry in settings_package_sources(settings) {
-        let Some((source, copied)) = migrate_profile_package_entry(
-            "vanilla",
-            vanilla_agent_dir,
-            &shared_addons_dir,
-            &package_entry,
-        )?
-        else {
-            continue;
-        };
-
-        copied_packages += usize::from(copied);
-
+    for source in normalize_package_source_list(sources) {
         if shared_source_set.insert(source.clone()) {
             shared_sources.push(source.clone());
             imported_packages += 1;
             shared_settings_changed = true;
         }
 
-        if global_source_set.insert(source.clone()) {
+        if activate && global_source_set.insert(source.clone()) {
             global_sources.push(source);
             activated_packages += 1;
             shared_settings_changed = true;
@@ -2101,11 +2132,290 @@ fn import_vanilla_pi_packages(
         write_settings_map(&shared_addons_dir, &shared_settings, "shared Pi add-ons")?;
     }
 
-    Ok((
+    Ok(SharedAddonUpdateResult {
         imported_packages,
         activated_packages,
+        global_packages: global_sources.len(),
+    })
+}
+
+fn local_vanilla_addon_source(resource_type: &str, entry_name: &str) -> String {
+    format!(
+        "local/vanilla/{resource_type}/{}",
+        safe_shared_source_segment(entry_name)
+    )
+}
+
+fn write_local_vanilla_addon_manifest(
+    package_dir: &Path,
+    source: &str,
+    resource_type: &str,
+    entries: Vec<String>,
+) -> Result<usize, String> {
+    let mut pi_manifest = serde_json::Map::new();
+    pi_manifest.insert(
+        resource_type.to_string(),
+        serde_json::to_value(entries)
+            .map_err(|error| format!("unable to serialize local add-on manifest: {error}"))?,
+    );
+
+    let manifest = serde_json::json!({
+        "name": format!("pioc-{}", safe_shared_source_segment(source).to_lowercase()),
+        "private": true,
+        "pi": serde_json::Value::Object(pi_manifest),
+    });
+    let manifest_json = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| format!("unable to serialize local add-on manifest: {error}"))?;
+
+    write_bytes_if_changed_atomic(
+        &package_dir.join("package.json"),
+        format!("{manifest_json}\n").as_bytes(),
+    )
+    .map(usize::from)
+}
+
+fn directory_entry_names(path: &Path) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    for entry in
+        fs::read_dir(path).map_err(|error| format!("unable to list {}: {error}", path.display()))?
+    {
+        let entry =
+            entry.map_err(|error| format!("unable to read {} entry: {error}", path.display()))?;
+        names.push(entry.file_name().to_string_lossy().to_string());
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn path_contents_equal(left: &Path, right: &Path) -> Result<bool, String> {
+    if !left.exists() || !right.exists() {
+        return Ok(false);
+    }
+
+    let left_metadata = fs::metadata(left)
+        .map_err(|error| format!("unable to inspect {}: {error}", left.display()))?;
+    let right_metadata = fs::metadata(right)
+        .map_err(|error| format!("unable to inspect {}: {error}", right.display()))?;
+
+    if left_metadata.is_file() && right_metadata.is_file() {
+        let left_contents = fs::read(left)
+            .map_err(|error| format!("unable to read {}: {error}", left.display()))?;
+        let right_contents = fs::read(right)
+            .map_err(|error| format!("unable to read {}: {error}", right.display()))?;
+        return Ok(left_contents == right_contents);
+    }
+
+    if left_metadata.is_dir() && right_metadata.is_dir() {
+        let left_names = directory_entry_names(left)?;
+        let right_names = directory_entry_names(right)?;
+        if left_names != right_names {
+            return Ok(false);
+        }
+
+        for name in left_names {
+            if !path_contents_equal(&left.join(&name), &right.join(&name))? {
+                return Ok(false);
+            }
+        }
+
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn remove_path_recursive(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+            .map_err(|error| format!("unable to remove {}: {error}", path.display()))
+    } else {
+        fs::remove_file(path)
+            .map_err(|error| format!("unable to remove {}: {error}", path.display()))
+    }
+}
+
+fn remove_profile_resource_copy_if_unchanged(
+    vanilla_entry: &Path,
+    target_profile_dir: &Path,
+    resource_type: &str,
+) -> Result<(), String> {
+    let Some(entry_name) = vanilla_entry.file_name() else {
+        return Ok(());
+    };
+    let profile_entry = target_profile_dir.join(resource_type).join(entry_name);
+
+    if path_contents_equal(vanilla_entry, &profile_entry)? {
+        remove_path_recursive(&profile_entry)?;
+    }
+
+    Ok(())
+}
+
+fn extension_manifest_entry(entry_path: &Path) -> Option<String> {
+    if entry_path.is_file() {
+        let file_name = entry_path.file_name()?.to_str()?;
+        return Some(format!("./{file_name}"));
+    }
+
+    for index_file in ["index.ts", "index.js"] {
+        if entry_path.join(index_file).exists() {
+            return Some(format!("./{index_file}"));
+        }
+    }
+
+    None
+}
+
+fn is_vanilla_resource_entry(resource_type: &str, path: &Path) -> bool {
+    if path.is_file() {
+        return is_supported_resource_file(resource_type, path);
+    }
+
+    match resource_type {
+        "extensions" => path.join("index.ts").exists() || path.join("index.js").exists(),
+        "skills" => path.join("SKILL.md").exists(),
+        _ => false,
+    }
+}
+
+fn import_vanilla_resource_package(
+    shared_addons_dir: &Path,
+    vanilla_agent_dir: &Path,
+    target_profile_dir: &Path,
+    resource_type: &str,
+    entry_path: &Path,
+) -> Result<Option<(String, usize)>, String> {
+    if !is_vanilla_resource_entry(resource_type, entry_path) {
+        return Ok(None);
+    }
+
+    let Some(entry_name) = entry_path.file_name().and_then(|value| value.to_str()) else {
+        return Ok(None);
+    };
+    let source = local_vanilla_addon_source(resource_type, entry_name);
+    let package_dir = shared_addons_dir.join(&source);
+    let mut copied_files = 0;
+
+    match resource_type {
+        "extensions" => {
+            let Some(manifest_entry) = extension_manifest_entry(entry_path) else {
+                return Ok(None);
+            };
+
+            if entry_path.is_file() {
+                copied_files += copy_path_recursive_changed_count(
+                    &vanilla_agent_dir.join("extensions"),
+                    &package_dir,
+                )?;
+            } else {
+                copied_files += copy_path_recursive_changed_count(entry_path, &package_dir)?;
+            }
+
+            copied_files += write_local_vanilla_addon_manifest(
+                &package_dir,
+                &source,
+                resource_type,
+                vec![manifest_entry],
+            )?;
+        }
+        "skills" | "prompts" | "themes" => {
+            let resource_dir = package_dir.join(resource_type);
+            let target_path = resource_dir.join(entry_name);
+            copied_files += copy_path_recursive_changed_count(entry_path, &target_path)?;
+            copied_files += write_local_vanilla_addon_manifest(
+                &package_dir,
+                &source,
+                resource_type,
+                vec![format!("./{resource_type}/{entry_name}")],
+            )?;
+        }
+        _ => return Ok(None),
+    }
+
+    remove_profile_resource_copy_if_unchanged(entry_path, target_profile_dir, resource_type)?;
+    Ok(Some((source, copied_files)))
+}
+
+fn import_vanilla_pi_resources(
+    app: &AppHandle,
+    vanilla_agent_dir: &Path,
+    target_profile_dir: &Path,
+) -> Result<VanillaResourceImportResult, String> {
+    let shared_addons_dir = ensure_shared_addons_dirs(app)?;
+    let mut sources = Vec::new();
+    let mut copied_files = 0;
+
+    for resource_type in PROFILE_RESOURCE_DIRS {
+        let resource_dir = vanilla_agent_dir.join(resource_type);
+        if !resource_dir.exists() {
+            continue;
+        }
+
+        for entry in fs::read_dir(&resource_dir).map_err(|error| {
+            format!(
+                "unable to list vanilla Pi {resource_type} directory {}: {error}",
+                resource_dir.display()
+            )
+        })? {
+            let entry = entry.map_err(|error| {
+                format!("unable to read vanilla Pi {resource_type} directory entry: {error}")
+            })?;
+
+            if let Some((source, copied)) = import_vanilla_resource_package(
+                &shared_addons_dir,
+                vanilla_agent_dir,
+                target_profile_dir,
+                resource_type,
+                &entry.path(),
+            )? {
+                sources.push(source);
+                copied_files += copied;
+            }
+        }
+    }
+
+    let update = update_shared_addon_settings(app, sources, true)?;
+    Ok(VanillaResourceImportResult {
+        copied_files,
+        imported_packages: update.imported_packages,
+        activated_packages: update.activated_packages,
+    })
+}
+
+fn import_vanilla_pi_packages(
+    app: &AppHandle,
+    vanilla_agent_dir: &Path,
+    settings: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(usize, usize, usize, usize), String> {
+    let shared_addons_dir = ensure_shared_addons_dirs(app)?;
+    let mut sources = Vec::new();
+    let mut copied_packages = 0;
+
+    for package_entry in settings_package_sources(settings) {
+        let Some((source, copied)) = migrate_profile_package_entry(
+            "vanilla",
+            vanilla_agent_dir,
+            &shared_addons_dir,
+            &package_entry,
+        )?
+        else {
+            continue;
+        };
+
+        copied_packages += usize::from(copied);
+        sources.push(source);
+    }
+
+    let update = update_shared_addon_settings(app, sources, true)?;
+    Ok((
+        update.imported_packages,
+        update.activated_packages,
         copied_packages,
-        global_sources.len(),
+        update.global_packages,
     ))
 }
 
@@ -2136,13 +2446,6 @@ fn migrate_vanilla_pi_agent(
     ensure_profile_subdirectories(&target_profile_dir)?;
 
     let vanilla_settings = read_profile_settings(&vanilla_agent_dir)?.unwrap_or_default();
-    let mut copied_resource_files = 0;
-    for resource_type in PROFILE_RESOURCE_DIRS {
-        copied_resource_files += copy_path_recursive_changed_count(
-            &vanilla_agent_dir.join(resource_type),
-            &target_profile_dir.join(resource_type),
-        )?;
-    }
 
     let mut profile = read_profile_files(&target_profile_dir)?;
     let updated_profile_settings =
@@ -2152,10 +2455,19 @@ fn migrate_vanilla_pi_agent(
         save_profile_files(app, profile)?;
     }
 
-    let (imported_packages, activated_packages, copied_packages, global_packages) =
+    let resource_import =
+        import_vanilla_pi_resources(app, &vanilla_agent_dir, &target_profile_dir)?;
+    let (package_imported_packages, package_activated_packages, copied_packages, global_packages) =
         import_vanilla_pi_packages(app, &vanilla_agent_dir, &vanilla_settings)?;
+    let copied_resource_files = resource_import.copied_files;
+    let imported_packages = resource_import.imported_packages + package_imported_packages;
+    let activated_packages = resource_import.activated_packages + package_activated_packages;
 
-    if imported_packages > 0 || activated_packages > 0 || copied_packages > 0 {
+    if imported_packages > 0
+        || activated_packages > 0
+        || copied_packages > 0
+        || copied_resource_files > 0
+    {
         rewrite_profile_settings_for_all_profiles(app)?;
     }
 
@@ -2850,6 +3162,283 @@ fn run_pi_package_command(
     }
 }
 
+#[cfg(windows)]
+fn run_external_command(
+    mut command: StdCommand,
+    display: &str,
+    timeout: Duration,
+) -> Result<PiCommandOutput, String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let child = command
+        .spawn()
+        .map_err(|error| format!("unable to run {display}: {error}"))?;
+    let (output, timed_out) = wait_for_child_output(child, timeout)?;
+    let result = PiCommandOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        code: output.status.code(),
+    };
+
+    if timed_out {
+        let mut message = format!("{display} timed out after {} seconds", timeout.as_secs());
+        let output_text = pi_command_output_text(&result);
+        if !output_text.is_empty() {
+            message.push_str("\n\n");
+            message.push_str(&output_text);
+        }
+        return Err(message);
+    }
+
+    if output.status.success() {
+        Ok(result)
+    } else {
+        let code = result
+            .code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut message = format!("{display} failed with exit code {code}");
+        let output_text = pi_command_output_text(&result);
+        if !output_text.is_empty() {
+            message.push_str("\n\n");
+            message.push_str(&output_text);
+        }
+        Err(message)
+    }
+}
+
+#[cfg(windows)]
+fn parse_package_version_output(output: &PiCommandOutput) -> Result<String, String> {
+    output
+        .stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.chars().any(char::is_whitespace))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            "unable to determine latest Pi package version from package manager output".to_string()
+        })
+}
+
+#[cfg(windows)]
+fn package_root_from_cli_path(cli_path: &Path) -> Option<PathBuf> {
+    let mut current = cli_path.parent();
+    while let Some(path) = current {
+        if path.join("package.json").is_file() && package_json_name(path).is_some() {
+            return Some(path.to_path_buf());
+        }
+
+        current = path.parent();
+    }
+
+    None
+}
+
+#[cfg(windows)]
+fn find_windows_command_shim(file_names: &[&str]) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+
+    for directory in std::env::split_paths(&path) {
+        for file_name in file_names {
+            let candidate = directory.join(file_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(windows)]
+fn find_pnpm_cmd_shim() -> Option<PathBuf> {
+    if let Some(pi_shim) = find_pi_cmd_shim() {
+        if let Some(shim_dir) = pi_shim.parent() {
+            for file_name in ["pnpm.CMD", "pnpm.cmd", "pnpm.BAT", "pnpm.bat"] {
+                let candidate = shim_dir.join(file_name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    find_windows_command_shim(&["pnpm.CMD", "pnpm.cmd", "pnpm.BAT", "pnpm.bat"])
+}
+
+#[cfg(windows)]
+fn pi_package_name_from_cmd_shim() -> Option<String> {
+    let shim_path = find_pi_cmd_shim()?;
+    let (_, cli_path, _) = parse_pi_cmd_shim(&shim_path)?;
+    let package_root = package_root_from_cli_path(&cli_path)?;
+    package_json_name(&package_root)
+}
+
+#[cfg(windows)]
+fn run_pnpm_command(
+    pnpm_shim: &Path,
+    args: &[String],
+    current_dir: &Path,
+) -> Result<PiCommandOutput, String> {
+    let mut command = StdCommand::new("cmd.exe");
+    command
+        .args(["/D", "/C"])
+        .arg(pnpm_shim.as_os_str())
+        .args(args)
+        .current_dir(current_dir)
+        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .creation_flags(CREATE_NO_WINDOW);
+
+    run_external_command(
+        command,
+        &format!("pnpm {}", args.join(" ")),
+        PI_PACKAGE_COMMAND_TIMEOUT,
+    )
+}
+
+#[cfg(windows)]
+fn run_pi_self_update_fallback() -> Result<(), String> {
+    let package_name = pi_package_name_from_cmd_shim().ok_or_else(|| {
+        "unable to inspect the current Pi pnpm shim for package-manager fallback update".to_string()
+    })?;
+    let pnpm_shim = find_pnpm_cmd_shim()
+        .ok_or_else(|| "unable to find pnpm for Pi fallback update".to_string())?;
+    let current_dir = pnpm_shim
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+
+    let version_output = run_pnpm_command(
+        &pnpm_shim,
+        &[
+            "view".to_string(),
+            package_name.clone(),
+            "version".to_string(),
+        ],
+        &current_dir,
+    )?;
+    let latest_version = parse_package_version_output(&version_output)?;
+    let package_spec = format!("{package_name}@{latest_version}");
+    let mut add_args = vec!["add".to_string(), "-g".to_string(), package_spec];
+
+    if let Some(global_bin_dir) =
+        find_pi_cmd_shim().and_then(|path| path.parent().map(Path::to_path_buf))
+    {
+        add_args.push("--global-bin-dir".to_string());
+        add_args.push(global_bin_dir.to_string_lossy().to_string());
+    }
+
+    run_pnpm_command(&pnpm_shim, &add_args, &current_dir).map(|_| ())
+}
+
+#[cfg(not(windows))]
+fn run_pi_self_update_fallback() -> Result<(), String> {
+    Err("no package-manager fallback is available for this platform".to_string())
+}
+
+fn with_startup_pi_update_lock<T>(
+    app: &AppHandle,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let lock_path = app_data_dir(app)?.join(PI_STARTUP_UPDATE_LOCK_FILE);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!("unable to create Pi startup update lock directory: {error}")
+        })?;
+    }
+
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| {
+            format!(
+                "unable to open Pi startup update lock {}: {error}",
+                lock_path.display()
+            )
+        })?;
+    lock_file.lock_exclusive().map_err(|error| {
+        format!(
+            "unable to lock Pi startup update {}: {error}",
+            lock_path.display()
+        )
+    })?;
+
+    let result = action();
+    if let Err(error) = lock_file.unlock() {
+        if result.is_ok() {
+            return Err(format!(
+                "unable to unlock Pi startup update {}: {error}",
+                lock_path.display()
+            ));
+        }
+    }
+
+    result
+}
+
+fn run_startup_pi_self_update(app: &AppHandle) -> Result<(), String> {
+    with_startup_pi_update_lock(app, || {
+        let shared_addons = prepare_shared_addons_for_package_command(app)?;
+        let args = ["update".to_string(), "--self".to_string()];
+        match run_pi_package_command(&shared_addons, &args) {
+            Ok(_) => Ok(()),
+            Err(pi_update_error) => run_pi_self_update_fallback().map_err(|fallback_error| {
+                format!(
+                    "pi update --self failed:\n{pi_update_error}\n\nPackage-manager fallback update failed:\n{fallback_error}"
+                )
+            }),
+        }
+    })
+}
+
+fn ensure_startup_pi_self_update(app: &AppHandle, state: &PtyState) -> Result<(), String> {
+    loop {
+        let mut status = state
+            .startup_pi_update
+            .lock()
+            .map_err(|_| "Pi startup update state is unavailable".to_string())?;
+
+        match &*status {
+            PiStartupUpdateStatus::Complete(result) => return result.clone(),
+            PiStartupUpdateStatus::Running => {
+                let _status = state
+                    .startup_pi_update_changed
+                    .wait(status)
+                    .map_err(|_| "Pi startup update state is unavailable".to_string())?;
+            }
+            PiStartupUpdateStatus::NotStarted => {
+                *status = PiStartupUpdateStatus::Running;
+                drop(status);
+
+                let result = run_startup_pi_self_update(app);
+                let mut status = state
+                    .startup_pi_update
+                    .lock()
+                    .map_err(|_| "Pi startup update state is unavailable".to_string())?;
+                *status = PiStartupUpdateStatus::Complete(result.clone());
+                state.startup_pi_update_changed.notify_all();
+                return result;
+            }
+        }
+    }
+}
+
+fn spawn_startup_pi_self_update(app: AppHandle) {
+    thread::spawn(move || {
+        if let Err(error) = ensure_startup_pi_self_update(&app, &app.state::<PtyState>()) {
+            eprintln!("automatic Pi startup update failed: {error}");
+        }
+    });
+}
+
 fn strip_pi_package_command_prefix(value: &str) -> &str {
     let mut rest = value.trim();
     let lower = rest.to_ascii_lowercase();
@@ -3272,6 +3861,12 @@ fn pty_start(
     }
 
     thread::spawn(move || {
+        if matches!(kind, PtyKind::Pi) {
+            if let Err(error) = ensure_startup_pi_self_update(&app, &app.state::<PtyState>()) {
+                emit_start_error(&app, id, error);
+                return;
+            }
+        }
         let pty_system = native_pty_system();
         let pair = match pty_system.openpty(PtySize {
             rows,
@@ -3525,6 +4120,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .setup(|app| {
+            spawn_startup_pi_self_update(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             pi_profiles_list,
             pi_profile_save,

@@ -102,6 +102,7 @@
     autoFocus = true,
     closing = false,
     layoutActive = true,
+    layoutKey = "",
     onReady,
     onClosed,
     onClose,
@@ -118,6 +119,7 @@
     autoFocus?: boolean;
     closing?: boolean;
     layoutActive?: boolean;
+    layoutKey?: string;
     onReady?: (id: number) => void;
     onClosed?: (id: number) => void;
     onClose?: () => void;
@@ -128,11 +130,13 @@
     selected?: boolean;
   } = $props();
 
+  let rootElement: HTMLElement;
   let hostElement: HTMLDivElement;
   let viewportElement = $state<HTMLElement | null>(null);
   let terminal: WTerm | null = null;
   let disposeTerminal: ((notifyClosed?: boolean) => Promise<void>) | null = null;
   let scheduleHostResize: (() => void) | null = null;
+  let observeViewportResize: ((element: HTMLElement | null) => void) | null = null;
   const statusLabels = {
     pi: {
       starting: "Starting Pi…",
@@ -169,9 +173,14 @@
   });
 
   $effect(() => {
+    void layoutKey;
     if (layoutActive && !closing) {
       scheduleHostResize?.();
     }
+  });
+
+  $effect(() => {
+    observeViewportResize?.(viewportElement);
   });
   $effect(() => {
     if (closing) {
@@ -398,16 +407,73 @@
     let unlistenError: UnlistenFn | null = null;
     let scrollTimer: number | null = null;
     let activityTimer: number | null = null;
+    let stickToBottom = true;
+    let scrollListenerElement: HTMLElement | null = null;
 
     let inputBuffer = "";
     let pendingTask: string | null = null;
     let resizeObserver: ResizeObserver | null = null;
     let resizeFrame: number | null = null;
+    let observedViewportElement: HTMLElement | null = null;
+    let lastPtyResizeCols: number | null = null;
+    let lastPtyResizeRows: number | null = null;
     let footerRowsObserver: MutationObserver | null = null;
     let footerRowsTimer: number | null = null;
 
     function scrollContainer() {
       return viewportElement ?? hostElement;
+    }
+
+    function terminalRowHeight() {
+      return Number.parseFloat(getComputedStyle(hostElement).getPropertyValue("--term-row-height")) || 17;
+    }
+
+    function trailingHiddenFooterHeight() {
+      if (kind !== "pi") return 0;
+
+      let height = 0;
+      let row = hostElement.querySelector<HTMLElement>(".term-grid > .term-row:last-child");
+      while (row?.classList.contains("pioc-terminal-footer-row-hidden")) {
+        height += row.getBoundingClientRect().height || terminalRowHeight();
+        const previousRow = row.previousElementSibling;
+        row = previousRow instanceof HTMLElement ? previousRow : null;
+      }
+
+      return height;
+    }
+
+    function maxScrollTop(element = scrollContainer()) {
+      const maxScroll = Math.max(0, element.scrollHeight - element.clientHeight);
+      return Math.max(0, maxScroll - trailingHiddenFooterHeight());
+    }
+
+    function bottomTolerance() {
+      return Math.max(48, terminalRowHeight() * 3);
+    }
+
+    function isNearBottom() {
+      const element = scrollContainer();
+      return maxScrollTop(element) - element.scrollTop <= bottomTolerance();
+    }
+
+    function scrollToBottom() {
+      const element = scrollContainer();
+      element.scrollTop = maxScrollTop(element);
+      stickToBottom = true;
+    }
+
+    function updateStickToBottomFromScroll() {
+      stickToBottom = isNearBottom();
+    }
+
+    function attachScrollListener() {
+      const element = scrollContainer();
+      if (scrollListenerElement === element) return;
+
+      scrollListenerElement?.removeEventListener("scroll", updateStickToBottomFromScroll);
+      scrollListenerElement = element;
+      scrollListenerElement.addEventListener("scroll", updateStickToBottomFromScroll, { passive: true });
+      updateStickToBottomFromScroll();
     }
 
     function measureTerminalSize() {
@@ -443,14 +509,39 @@
       };
     }
 
+    function syncPtySize(targetTerminal = terminal ?? nextTerminal) {
+      if (!targetTerminal || !ptyReady || cancelled) return;
+
+      const cols = targetTerminal.cols;
+      const rows = targetTerminal.rows;
+      if (cols === lastPtyResizeCols && rows === lastPtyResizeRows) return;
+
+      lastPtyResizeCols = cols;
+      lastPtyResizeRows = rows;
+      void invoke("pty_resize", { id, cols, rows }).catch(() => {
+        if (lastPtyResizeCols === cols && lastPtyResizeRows === rows) {
+          lastPtyResizeCols = null;
+          lastPtyResizeRows = null;
+        }
+      });
+    }
+
     function resizeTerminalToHost(targetTerminal = terminal ?? nextTerminal) {
       if (!targetTerminal || !layoutActive || cancelled || closing) return;
 
+      attachScrollListener();
+      const shouldScroll = stickToBottom || isNearBottom();
       const size = measureTerminalSize();
       if (!size) return;
 
       if (size.cols !== targetTerminal.cols || size.rows !== targetTerminal.rows) {
         targetTerminal.resize(size.cols, size.rows);
+      }
+
+      syncPtySize(targetTerminal);
+
+      if (shouldScroll) {
+        scheduleScrollToBottom();
       }
     }
 
@@ -463,33 +554,40 @@
       });
     }
 
+    function observeViewportResizeTarget(element: HTMLElement | null) {
+      if (!resizeObserver || observedViewportElement === element) return;
+
+      if (observedViewportElement) {
+        resizeObserver.unobserve(observedViewportElement);
+      }
+
+      observedViewportElement = element;
+      if (observedViewportElement) {
+        resizeObserver.observe(observedViewportElement);
+      }
+
+      attachScrollListener();
+      if (layoutActive) {
+        scheduleResizeToHost();
+      }
+    }
+
     scheduleHostResize = scheduleResizeToHost;
+    observeViewportResize = observeViewportResizeTarget;
 
     resizeObserver = new ResizeObserver(() => {
       if (layoutActive) {
         scheduleResizeToHost();
       }
     });
-    resizeObserver.observe(scrollContainer());
+    resizeObserver.observe(rootElement);
+    resizeObserver.observe(hostElement);
+    observeViewportResizeTarget(viewportElement);
+    window.addEventListener("resize", scheduleResizeToHost);
 
     if (layoutActive) {
       scheduleResizeToHost();
     }
-    function isNearBottom() {
-      const element = scrollContainer();
-      const maxScroll = Math.max(0, element.scrollHeight - element.clientHeight);
-      return maxScroll - element.scrollTop < 24;
-    }
-
-    function scrollToBottom() {
-      const element = scrollContainer();
-      const maxScroll = Math.max(0, element.scrollHeight - element.clientHeight);
-      const rowHeight =
-        Number.parseFloat(getComputedStyle(hostElement).getPropertyValue("--term-row-height")) || 17;
-
-      element.scrollTop = Math.floor(maxScroll / rowHeight) * rowHeight;
-    }
-
     function normalizeTerminalRowText(value: string) {
       return value.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
     }
@@ -526,8 +624,11 @@
       hostElement.querySelectorAll<HTMLElement>(".term-row").forEach((row) => {
         row.classList.toggle("pioc-terminal-footer-row-hidden", isPiBuiltinFooterRow(row.textContent ?? ""));
       });
-    }
 
+      if (stickToBottom) {
+        scrollToBottom();
+      }
+    }
     function scheduleSuppressPiFooterRows() {
       if (kind !== "pi" || footerRowsTimer !== null) return;
 
@@ -544,7 +645,16 @@
 
       scrollTimer = window.setTimeout(() => {
         scrollTimer = null;
-        window.requestAnimationFrame(scrollToBottom);
+        window.requestAnimationFrame(() => {
+          if (cancelled) return;
+
+          scrollToBottom();
+          window.requestAnimationFrame(() => {
+            if (!cancelled && stickToBottom) {
+              scrollToBottom();
+            }
+          });
+        });
       }, 0);
     }
 
@@ -658,7 +768,10 @@
       unlistenExit?.();
       unlistenReady?.();
       unlistenError?.();
-
+      if (scrollListenerElement) {
+        scrollListenerElement.removeEventListener("scroll", updateStickToBottomFromScroll);
+        scrollListenerElement = null;
+      }
       if (scrollTimer !== null) {
         window.clearTimeout(scrollTimer);
         scrollTimer = null;
@@ -709,26 +822,30 @@
           onSelect?.();
           if (trackUserInput(ptyInput)) {
             onUserInput?.(id);
+            stickToBottom = true;
+            scheduleScrollToBottom();
           }
           void invoke("pty_write", { id, data: ptyInput });
         },
-        onResize: (cols, rows) => {
-          if (!ptyReady || cancelled) return;
-          void invoke("pty_resize", { id, cols, rows });
+        onResize: () => {
+          syncPtySize(nextTerminal);
         },
       });
 
       try {
         unlistenData = await listen<PtyDataPayload>("pty:data", (event) => {
           if (event.payload.id === id && !cancelled) {
-            const shouldScroll = isNearBottom();
+            const shouldScroll = stickToBottom || isNearBottom();
 
             nextTerminal?.write(event.payload.data);
             scheduleSuppressPiFooterRows();
             markBackendActivity(event.payload.data);
 
             if (shouldScroll) {
+              stickToBottom = true;
               scheduleScrollToBottom();
+            } else {
+              stickToBottom = false;
             }
           }
         });
@@ -743,6 +860,8 @@
         unlistenReady = await listen<PtyReadyPayload>("pty:ready", (event) => {
           if (event.payload.id === id && !cancelled) {
             ptyReady = true;
+            lastPtyResizeCols = null;
+            lastPtyResizeRows = null;
             status = statusLabel("ready");
             agentWorking = false;
             activitySummary = kind === "shell" ? statusLabel("ready") : "Waiting for task";
@@ -752,6 +871,9 @@
               activityTimer = null;
             }
             onReady?.(id);
+            resizeTerminalToHost(nextTerminal);
+            syncPtySize(nextTerminal);
+            scheduleResizeToHost();
 
             if (autoFocus) {
               nextTerminal?.focus();
@@ -817,11 +939,13 @@
     }
 
     return () => {
+      window.removeEventListener("resize", scheduleResizeToHost);
       resizeObserver?.disconnect();
       if (resizeFrame !== null) {
         window.cancelAnimationFrame(resizeFrame);
       }
       scheduleHostResize = null;
+      observeViewportResize = null;
       void stopTerminal(false);
       disposeTerminal = null;
     };
@@ -829,6 +953,7 @@
 </script>
 
 <section
+  bind:this={rootElement}
   class="flex min-h-0 flex-1 flex-col overflow-hidden border border-border bg-card text-card-foreground transition-shadow"
   style={selected
     ? "outline: 1px solid rgba(34, 211, 238, 0.38); outline-offset: -1px; box-shadow: 0 0 14px rgba(34, 211, 238, 0.24), inset 0 0 10px rgba(34, 211, 238, 0.08);"
@@ -995,18 +1120,22 @@
     overflow: visible !important;
   }
   /*
-   * @wterm/dom propagates the last cell background to the entire row/grid when
-   * a line exactly fills the terminal. Pi's input draws its cursor as a
-   * reverse-video cell, so when that cell lands in the final column the whole
-   * input row turns white. Keep cell-level backgrounds, but suppress the
-   * renderer's row/grid-wide background propagation.
+   * @wterm/dom uses the final cell background to paint full-width row/grid
+   * backgrounds and a 1px row seam. Pi's cards/tool blocks rely on that for
+   * complete right edges and continuous filled areas.
+   *
+   * The bad case is only a final-column cursor/reverse-video cell: propagating
+   * that cell turns the whole row/grid into the cursor color. Clear just that
+   * propagated background while preserving normal terminal backgrounds.
    */
-  :global(.terminal-host .term-grid),
-  :global(.terminal-host .term-row) {
+  :global(.terminal-host .term-row:has(> .term-cursor:last-child)) {
     background: transparent !important;
     box-shadow: none !important;
   }
 
+  :global(.terminal-host .term-grid:has(> .term-row:last-child > .term-cursor:last-child)) {
+    background: transparent !important;
+  }
   :global(.terminal-host .term-row.pioc-terminal-footer-row-hidden) {
     visibility: hidden;
   }
