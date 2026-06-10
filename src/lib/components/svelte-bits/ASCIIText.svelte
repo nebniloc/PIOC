@@ -41,6 +41,22 @@ void main() {
 	}
 
 	const PX_RATIO = typeof window !== 'undefined' ? window.devicePixelRatio : 1;
+	const ASCII_FONT_FAMILY = '"Geist Mono Variable", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+	const ASCII_FONT_LOAD_FAMILY = '"Geist Mono Variable"';
+
+	async function waitForAsciiFonts(textFontSize: number, asciiFontSize: number) {
+		if (typeof document === 'undefined' || !document.fonts) return;
+
+		try {
+			await Promise.all([
+				document.fonts.load(`600 ${textFontSize}px ${ASCII_FONT_LOAD_FAMILY}`),
+				document.fonts.load(`500 ${asciiFontSize}px ${ASCII_FONT_LOAD_FAMILY}`)
+			]);
+			await document.fonts.ready;
+		} catch {
+			// Keep rendering with the local mono fallback if font loading is not available.
+		}
+	}
 
 	interface AsciiFilterOptions {
 		fontSize?: number;
@@ -86,7 +102,7 @@ void main() {
 			this.invert = invert ?? true;
 			this.interactive = interactive ?? true;
 			this.fontSize = fontSize ?? 12;
-			this.fontFamily = fontFamily ?? "'Courier New', monospace";
+			this.fontFamily = fontFamily ?? ASCII_FONT_FAMILY;
 			this.charset = charset ?? ' .\'`^",:;Il!i~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$';
 			if (this.context) {
 				this.context.imageSmoothingEnabled = false;
@@ -199,7 +215,7 @@ void main() {
 		color: string;
 		font: string;
 
-		constructor(txt: string, { fontSize = 200, fontFamily = 'Arial', color = '#fdf9f3' }: CanvasTxtOptions = {}) {
+		constructor(txt: string, { fontSize = 200, fontFamily = ASCII_FONT_FAMILY, color = '#fdf9f3' }: CanvasTxtOptions = {}) {
 			this.canvas = document.createElement('canvas');
 			this.context = this.canvas.getContext('2d');
 			this.txt = txt;
@@ -292,13 +308,7 @@ void main() {
 		}
 
 		async init() {
-			try {
-				await document.fonts.load('600 200px "IBM Plex Mono"');
-				await document.fonts.load('500 12px "IBM Plex Mono"');
-			} catch {
-				// ignore font load errors and proceed with fallback fonts
-			}
-			await document.fonts.ready;
+			await waitForAsciiFonts(this.textFontSize, this.asciiFontSize);
 			this.setMesh();
 			this.setRenderer();
 		}
@@ -306,7 +316,7 @@ void main() {
 		setMesh() {
 			this.textCanvas = new CanvasTxt(this.textString, {
 				fontSize: this.textFontSize,
-				fontFamily: 'IBM Plex Mono',
+				fontFamily: ASCII_FONT_FAMILY,
 				color: this.textColor
 			});
 			this.textCanvas.resize();
@@ -339,7 +349,7 @@ void main() {
 			this.renderer.setPixelRatio(1);
 			this.renderer.setClearColor(0x000000, 0);
 			this.filter = new AsciiFilter(this.renderer, {
-				fontFamily: 'IBM Plex Mono',
+				fontFamily: ASCII_FONT_FAMILY,
 				fontSize: this.asciiFontSize,
 				invert: true,
 				interactive: this.interactive
@@ -546,11 +556,6 @@ void main() {
 	});
 </script>
 
-<svelte:head>
-	<link rel="preconnect" href="https://fonts.googleapis.com" />
-	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
-	<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet" />
-</svelte:head>
 
 <div
 	bind:this={containerEl}
