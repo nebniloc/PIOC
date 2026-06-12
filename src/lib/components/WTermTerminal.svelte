@@ -962,14 +962,14 @@
   aria-label={kind === "shell" ? `Terminal ${id}` : `Pi instance ${id}`}
   onpointerdown={() => onSelect?.()}
 >
-  <div class="flex items-center justify-between gap-2 border-b px-3 py-2">
+  <div class="flex items-center justify-between gap-2 border-b px-2 py-1">
     {#if kind === "pi"}
       <Popover.Root>
         <Popover.Trigger
           type="button"
           class={buttonVariants({
             variant: "ghost",
-            class: "h-auto min-w-0 flex-1 shrink justify-start gap-2 px-1.5 py-1 text-left",
+            class: "h-auto min-w-0 flex-1 shrink justify-start gap-2 px-1.5 py-0.5 text-left",
           })}
           title="Open Pi controls"
           aria-label={`Open controls for ${piProfileName ?? `Pi instance ${id}`}`}

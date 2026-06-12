@@ -1,11 +1,14 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
+  import { flip } from "svelte/animate";
   import { invoke } from "@tauri-apps/api/core";
   import { Store } from "@tauri-apps/plugin-store";
   import { open } from "@tauri-apps/plugin-dialog";
   import { relaunch } from "@tauri-apps/plugin-process";
   import { check } from "@tauri-apps/plugin-updater";
+  import { dragHandle, dragHandleZone, SHADOW_ITEM_MARKER_PROPERTY_NAME, type DndEvent } from "svelte-dnd-action";
   import RiDeleteBinLine from "remixicon-svelte/icons/delete-bin-line";
+  import RiDragMove2Line from "remixicon-svelte/icons/drag-move-2-line";
   import RiFolderOpenLine from "remixicon-svelte/icons/folder-open-line";
   import RiStarFill from "remixicon-svelte/icons/star-fill";
   import RiStarLine from "remixicon-svelte/icons/star-line";
@@ -14,10 +17,10 @@
   import * as Dialog from "$lib/components/ui/dialog";
   import { Separator } from "$lib/components/ui/separator";
   import WTermTerminal from "$lib/components/WTermTerminal.svelte";
-  import HotkeyList from "$lib/components/HotkeyList.svelte";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import ASCIIText from "$lib/components/svelte-bits/ASCIIText.svelte";
   import type { CommandPaletteCommand } from "$lib/command-palette";
+  import { cn } from "$lib/utils";
 
   type TerminalKind = "pi" | "shell";
 
@@ -74,12 +77,21 @@
 
   type TerminalSession = {
     id: number;
+    workspaceInstanceId: string;
     cached: boolean;
     kind: TerminalKind;
     piProfileId?: string;
     workingDirectory?: string;
     closing?: boolean;
     hasUserInput?: boolean;
+  };
+
+  type TerminalDndItem = {
+    id: string;
+    terminalId: number;
+    kind: TerminalKind;
+    piProfileId?: string;
+    [SHADOW_ITEM_MARKER_PROPERTY_NAME]?: boolean;
   };
 
   type SavedWorkspaceTerminal = {
@@ -93,6 +105,17 @@
     terminals: SavedWorkspaceTerminal[];
     savedAt: string;
     lastUsedAt: string;
+  };
+
+  type WorkspaceRuntime = {
+    instanceId: string;
+    savedWorkspaceId?: string;
+    name: string;
+    workingDirectory?: string;
+    selectedTerminalId: number | null;
+    fullscreenTerminalId: number | null;
+    cachedTerminalReady: boolean;
+    dirty?: boolean;
   };
   const WORKSPACES_STORE_PATH = "workspaces.json";
   const WORKSPACES_KEY = "workspaces";
@@ -108,6 +131,12 @@
   const PREWARM_FAVORITE_PI_PROFILE = false;
   const TERMINAL_CLOSE_CONFIRMATION_MESSAGE =
     "This terminal has received input. Closing it will stop the process and lose any in-progress work. Close it anyway?";
+  const TERMINAL_DND_TYPE = "terminal-layout";
+  const TERMINAL_DND_FLIP_DURATION_MS = 140;
+  const TERMINAL_DND_DROP_TARGET_STYLE = {
+    outline: "1px solid color-mix(in oklab, var(--ring) 65%, transparent)",
+    outlineOffset: "-1px",
+  };
   const PROFILE_SETTINGS_CONTROL_CLASS =
     "dark:bg-input/30 border-input focus-visible:border-ring focus-visible:ring-ring/50 aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:border-destructive dark:aria-invalid:border-destructive/50 disabled:bg-input/50 dark:disabled:bg-input/80 h-8 w-full min-w-0 rounded-none border bg-transparent px-2.5 py-1 text-xs transition-colors focus-visible:ring-1 aria-invalid:ring-1 outline-none disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50";
   const PROFILE_SETTINGS_TEXTAREA_CLASS =
@@ -176,14 +205,46 @@
   function cycleHomeAsciiPalette() {
     homeAsciiPalette = createHomeAsciiPalette();
   }
+
+  function createWorkspaceInstanceId() {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      return `runtime-${crypto.randomUUID()}`;
+    }
+
+    return `runtime-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+
+  function createWorkspaceRuntime(options: Partial<WorkspaceRuntime> = {}): WorkspaceRuntime {
+    return {
+      instanceId: options.instanceId ?? createWorkspaceInstanceId(),
+      savedWorkspaceId: options.savedWorkspaceId,
+      name: options.name?.trim() || "Untitled",
+      workingDirectory: options.workingDirectory,
+      selectedTerminalId: options.selectedTerminalId ?? null,
+      fullscreenTerminalId: options.fullscreenTerminalId ?? null,
+      cachedTerminalReady: options.cachedTerminalReady ?? false,
+      dirty: options.dirty ?? false,
+    };
+  }
   let {
     onHotkeysChange,
+    onAppUpdateActionChange,
   }: {
     onHotkeysChange?: (hotkeys: string[]) => void;
+    onAppUpdateActionChange?: (action: { disabled: boolean; title: string; run: () => void }) => void;
   } = $props();
+  const initialWorkspaceInstanceId = createWorkspaceInstanceId();
   let terminalSessions = $state<TerminalSession[]>(
     PREWARM_FAVORITE_PI_PROFILE
-      ? [{ id: 1, cached: true, kind: "pi", piProfileId: DEFAULT_PI_PROFILE_ID }]
+      ? [
+          {
+            id: 1,
+            workspaceInstanceId: initialWorkspaceInstanceId,
+            cached: true,
+            kind: "pi",
+            piProfileId: DEFAULT_PI_PROFILE_ID,
+          },
+        ]
       : [],
   );
   let nextTerminalId = PREWARM_FAVORITE_PI_PROFILE ? 1 : 0;
@@ -191,7 +252,10 @@
   let selectedTerminalId = $state<number | null>(null);
   let fullscreenTerminalId = $state<number | null>(null);
   let savedWorkspaces = $state<SavedWorkspace[]>([]);
-  let activeWorkspaceId = $state<string | null>(null);
+  let runningWorkspaces = $state<WorkspaceRuntime[]>([
+    createWorkspaceRuntime({ instanceId: initialWorkspaceInstanceId }),
+  ]);
+  let activeWorkspaceInstanceId = $state(initialWorkspaceInstanceId);
 
   let piProfiles = $state<PiProfile[]>([]);
   let piAddonPackages = $state<PiAddonPackage[]>([]);
@@ -250,23 +314,45 @@
   let workspacePersistenceReady = $state(false);
   let workspaceStore: Store | null = null;
   let profileSettingsStore: Store | null = null;
+  let terminalDndActive = $state(false);
+  let terminalDndWorkspaceInstanceId = $state<string | null>(null);
+  let terminalDndInitialTerminalIds = $state<number[]>([]);
+  let terminalDndItems = $state<TerminalDndItem[]>([]);
   let activeTerminalCount = $derived(
+    terminalSessions.filter(
+      (terminal) =>
+        terminal.workspaceInstanceId === activeWorkspaceInstanceId && !terminal.cached && !terminal.closing,
+    ).length,
+  );
+  let totalRunningTerminalCount = $derived(
     terminalSessions.filter((terminal) => !terminal.cached && !terminal.closing).length,
   );
   let terminalLayoutKey = $derived(
     [
+      `workspace:${activeWorkspaceInstanceId}`,
       fullscreenTerminalId === null ? "layout:all" : `layout:fullscreen:${fullscreenTerminalId}`,
       ...terminalSessions
         .filter(
           (terminal) =>
-            !terminal.cached && (fullscreenTerminalId === null || terminal.id === fullscreenTerminalId),
+            terminal.workspaceInstanceId === activeWorkspaceInstanceId &&
+            !terminal.cached &&
+            (fullscreenTerminalId === null || terminal.id === fullscreenTerminalId),
         )
         .map((terminal) => `${terminal.id}:${terminal.closing ? "closing" : "open"}`),
     ].join("|"),
   );
-  let recentWorkspaces = $derived(
-    [...savedWorkspaces].sort((a, b) => workspaceUsageTimestamp(b) - workspaceUsageTimestamp(a)).slice(0, 3),
-  );
+  let activeLayoutTerminals = $derived(terminalSessions.filter(terminalIsLayoutVisible));
+  let terminalDndEnabled = $derived(activeLayoutTerminals.length > 1 && fullscreenTerminalId === null);
+  let terminalDndOptions = $derived({
+    items: terminalDndItems,
+    type: TERMINAL_DND_TYPE,
+    flipDurationMs: TERMINAL_DND_FLIP_DURATION_MS,
+    dragDisabled: !terminalDndEnabled,
+    dropFromOthersDisabled: true,
+    dropTargetStyle: TERMINAL_DND_DROP_TARGET_STYLE,
+    delayTouchStart: true,
+    useCursorForDetection: true,
+  });
   let favoritePiLaunchReady = $derived(!PREWARM_FAVORITE_PI_PROFILE || cachedTerminalReady);
   let commandPaletteCommands = $derived([
     {
@@ -323,6 +409,25 @@
       run: () => void closeSelectedOrNewestTerminal(),
     },
     {
+      id: "workspace.new",
+      title: "New workspace",
+      description: "Create an empty workspace without stopping the current one.",
+      group: "Workspaces",
+      keywords: ["new", "workspace", "tab"],
+      run: createNewWorkspace,
+    },
+    {
+      id: "workspace.close",
+      title: "Close workspace",
+      description: activeTerminalCount > 0
+        ? `Close ${activeWorkspaceName()} and stop its running terminals.`
+        : `Close ${activeWorkspaceName()}.`,
+      group: "Workspaces",
+      keywords: ["close", "workspace", "tab", activeWorkspaceName()],
+      disabled: runningWorkspaces.length === 0,
+      run: () => requestCloseWorkspace(activeWorkspaceInstanceId),
+    },
+    {
       id: "workspace.save",
       title: "Save workspace…",
       description: workspacePersistenceReady
@@ -361,15 +466,16 @@
       description: appUpdateCommandDescription(),
       group: "App",
       keywords: ["update", "upgrade", "release", "restart", "prod", APP_UPDATE_CHANNEL],
-      disabled: !APP_UPDATER_ENABLED || appUpdateRunning || activeTerminalCount > 0,
+      disabled: appUpdateDisabled(),
       run: () => void checkForAppUpdate(),
     },
 
   ] satisfies CommandPaletteCommand[]);
   $effect(() => {
-    const hotkeys: string[] = ["CTRL+K: Command Palette"];
+    const hotkeys: string[] = [];
 
     if (activeTerminalCount > 0) {
+      hotkeys.push("CTRL+K: Command Palette");
       hotkeys.push("CTRL+S: Save Workspace");
 
       if (savedWorkspaces.length > 0) {
@@ -393,6 +499,20 @@
     }
 
     onHotkeysChange?.(hotkeys);
+  });
+
+  $effect(() => {
+    onAppUpdateActionChange?.({
+      disabled: appUpdateDisabled(),
+      title: appUpdateCommandDescription(),
+      run: () => void checkForAppUpdate(),
+    });
+  });
+
+  $effect(() => {
+    if (!terminalDndActive) {
+      terminalDndItems = terminalDndItemsForSessions(activeLayoutTerminals);
+    }
   });
 
   onMount(() => {
@@ -498,10 +618,14 @@
     return JSON.stringify(settings, null, 2);
   }
 
+  function appUpdateDisabled() {
+    return !APP_UPDATER_ENABLED || appUpdateRunning || totalRunningTerminalCount > 0;
+  }
+
   function appUpdateCommandDescription() {
     if (!APP_UPDATER_ENABLED) return `Updates are disabled for ${APP_UPDATE_CHANNEL} builds.`;
     if (appUpdateRunning) return appUpdateMessage || "Checking for signed app updates…";
-    if (activeTerminalCount > 0) return "Close all running terminals before installing an app update.";
+    if (totalRunningTerminalCount > 0) return "Close all running terminals before installing an app update.";
     return "Check the production release channel for a signed PIOC update.";
   }
 
@@ -526,7 +650,7 @@
       return;
     }
 
-    if (activeTerminalCount > 0) {
+    if (totalRunningTerminalCount > 0) {
       appUpdateMessage = "Close all running terminals before checking for an app update.";
       return;
     }
@@ -729,24 +853,7 @@
     return `New ${hotkeyProfileDisplayName(favoritePiProfileId)} PI`;
   }
 
-  function emptyPageHotkeyHints() {
-    const hints: string[] = ["CTRL+K: Command Palette"];
 
-    if (savedWorkspaces.length > 0) {
-      hints.push("CTRL+O: Open Workspace");
-    }
-
-    if (favoritePiLaunchReady) {
-      hints.push(`CTRL+N: ${newFavoritePiHotkeyText()}`);
-      hints.push("CTRL+SHIFT+N: Select PI");
-      hints.push("CTRL+T: Terminal");
-    } else {
-      hints.push("CTRL+SHIFT+N: Select PI");
-      hints.push(`Preparing ${hotkeyProfileDisplayName(favoritePiProfileId)} PI instance…`);
-    }
-
-    return hints;
-  }
   function samePiProfile(left?: string, right?: string) {
     return normalizeProfileId(left) === normalizeProfileId(right);
   }
@@ -769,17 +876,30 @@
   }
 
   function resetCachedPiTerminal(workingDirectory = activeWorkspaceWorkingDirectory()) {
+    if (!PREWARM_FAVORITE_PI_PROFILE) return;
+
+    const workspace = ensureActiveWorkspaceRuntime();
     const normalizedWorkingDirectory = normalizeWorkingDirectory(workingDirectory);
     const nextCachedTerminal: TerminalSession = {
       id: ++nextTerminalId,
+      workspaceInstanceId: workspace.instanceId,
       cached: true,
       kind: "pi",
       piProfileId: favoritePiProfileId || DEFAULT_PI_PROFILE_ID,
       workingDirectory: normalizedWorkingDirectory || undefined,
     };
 
-    terminalSessions = [...terminalSessions.filter((terminal) => !terminal.cached), nextCachedTerminal];
+    terminalSessions = [
+      ...terminalSessions.filter(
+        (terminal) => !(terminal.workspaceInstanceId === workspace.instanceId && terminal.cached),
+      ),
+      nextCachedTerminal,
+    ];
     cachedTerminalReady = false;
+    updateActiveWorkspaceRuntime((currentWorkspace) => ({
+      ...currentWorkspace,
+      cachedTerminalReady: false,
+    }));
   }
 
   async function initializePiProfiles() {
@@ -1209,9 +1329,293 @@
     localStorage.setItem(FALLBACK_STORAGE_KEY, JSON.stringify(workspaces));
   }
 
+  function workspaceRuntimeById(instanceId: string | null | undefined) {
+    return instanceId ? runningWorkspaces.find((workspace) => workspace.instanceId === instanceId) : undefined;
+  }
+
+  function activeWorkspaceRuntime() {
+    return workspaceRuntimeById(activeWorkspaceInstanceId) ?? runningWorkspaces[0] ?? null;
+  }
+
+  function ensureActiveWorkspaceRuntime() {
+    const existingWorkspace = activeWorkspaceRuntime();
+    if (existingWorkspace) return existingWorkspace;
+
+    const workspace = createWorkspaceRuntime();
+    runningWorkspaces = [workspace];
+    activeWorkspaceInstanceId = workspace.instanceId;
+    selectedTerminalId = workspace.selectedTerminalId;
+    fullscreenTerminalId = workspace.fullscreenTerminalId;
+    cachedTerminalReady = workspace.cachedTerminalReady;
+    return workspace;
+  }
+
+  function visibleTerminalsForWorkspace(instanceId: string) {
+    return terminalSessions.filter(
+      (terminal) => terminal.workspaceInstanceId === instanceId && !terminal.cached && !terminal.closing,
+    );
+  }
+
+  function workspaceTerminalCount(instanceId: string) {
+    return visibleTerminalsForWorkspace(instanceId).length;
+  }
+
+  function terminalDndItemId(terminalId: number) {
+    return `terminal-${terminalId}`;
+  }
+
+  function terminalDndItemsForSessions(sessions: TerminalSession[]): TerminalDndItem[] {
+    return sessions.map((terminal) => ({
+      id: terminalDndItemId(terminal.id),
+      terminalId: terminal.id,
+      kind: terminal.kind,
+      piProfileId: terminal.kind === "pi" ? normalizeProfileId(terminal.piProfileId) : undefined,
+    }));
+  }
+
+  function terminalDndItemIsShadow(item: TerminalDndItem) {
+    return Boolean(item[SHADOW_ITEM_MARKER_PROPERTY_NAME]);
+  }
+
+  function terminalDndItemLabel(item: TerminalDndItem) {
+    const terminal = terminalSessions.find((candidate) => candidate.id === item.terminalId);
+    if (!terminal) return "terminal";
+
+    return terminal.kind === "pi"
+      ? `${profileDisplayName(terminal.piProfileId)} PI instance`
+      : `Terminal ${terminal.id}`;
+  }
+
+  function normalizeTerminalDndItems(items: TerminalDndItem[], instanceId: string) {
+    const terminalById = new Map(
+      visibleTerminalsForWorkspace(instanceId).map((terminal) => [terminal.id, terminal]),
+    );
+
+    return items.flatMap((item) => {
+      const terminal = terminalById.get(item.terminalId);
+      if (!terminal) return [];
+
+      const [normalizedItem] = terminalDndItemsForSessions([terminal]);
+      return [
+        {
+          ...normalizedItem,
+          id: item.id || normalizedItem.id,
+          [SHADOW_ITEM_MARKER_PROPERTY_NAME]: terminalDndItemIsShadow(item) || undefined,
+        },
+      ];
+    });
+  }
+
+  function sameTerminalIdOrder(left: number[], right: number[]) {
+    return left.length === right.length && left.every((terminalId, index) => terminalId === right[index]);
+  }
+
+  function terminalDndOrderedTerminalIds(items: TerminalDndItem[], instanceId: string) {
+    const availableTerminals = visibleTerminalsForWorkspace(instanceId);
+    const availableIds = new Set(availableTerminals.map((terminal) => terminal.id));
+    const orderedIds: number[] = [];
+    const orderedIdSet = new Set<number>();
+
+    for (const item of items) {
+      if (!availableIds.has(item.terminalId) || orderedIdSet.has(item.terminalId)) continue;
+
+      orderedIds.push(item.terminalId);
+      orderedIdSet.add(item.terminalId);
+    }
+
+    for (const terminal of availableTerminals) {
+      if (!orderedIdSet.has(terminal.id)) {
+        orderedIds.push(terminal.id);
+      }
+    }
+
+    return orderedIds;
+  }
+
+  function applyTerminalOrderForWorkspace(instanceId: string, orderedTerminalIds: number[], markDirty = false) {
+    const visibleTerminals = visibleTerminalsForWorkspace(instanceId);
+    if (visibleTerminals.length === 0) return;
+
+    const terminalById = new Map(visibleTerminals.map((terminal) => [terminal.id, terminal]));
+    const orderedTerminals = orderedTerminalIds.flatMap((terminalId) => {
+      const terminal = terminalById.get(terminalId);
+      return terminal ? [terminal] : [];
+    });
+    const orderedIdSet = new Set(orderedTerminals.map((terminal) => terminal.id));
+    const nextVisibleTerminals = [
+      ...orderedTerminals,
+      ...visibleTerminals.filter((terminal) => !orderedIdSet.has(terminal.id)),
+    ];
+    const currentOrder = visibleTerminals.map((terminal) => terminal.id);
+    const nextOrder = nextVisibleTerminals.map((terminal) => terminal.id);
+
+    if (!sameTerminalIdOrder(currentOrder, nextOrder)) {
+      const nextVisibleQueue = [...nextVisibleTerminals];
+      terminalSessions = terminalSessions.map((terminal) =>
+        terminal.workspaceInstanceId === instanceId && !terminal.cached && !terminal.closing
+          ? (nextVisibleQueue.shift() ?? terminal)
+          : terminal,
+      );
+    }
+
+    if (markDirty) {
+      updateWorkspaceRuntime(instanceId, (workspace) => ({
+        ...workspace,
+        dirty: true,
+      }));
+    }
+  }
+
+  function beginTerminalDndIfNeeded(instanceId: string) {
+    if (terminalDndActive) return;
+
+    terminalDndActive = true;
+    terminalDndWorkspaceInstanceId = instanceId;
+    terminalDndInitialTerminalIds = visibleTerminalsForWorkspace(instanceId).map((terminal) => terminal.id);
+  }
+
+  function handleTerminalDndConsider(event: CustomEvent<DndEvent<TerminalDndItem>>) {
+    const instanceId = terminalDndWorkspaceInstanceId ?? activeWorkspaceInstanceId;
+    beginTerminalDndIfNeeded(instanceId);
+
+    const expectedTerminalCount = visibleTerminalsForWorkspace(instanceId).length;
+    const nextItems = normalizeTerminalDndItems(event.detail.items, instanceId);
+    if (nextItems.length !== expectedTerminalCount) return;
+
+    terminalDndItems = nextItems;
+    applyTerminalOrderForWorkspace(instanceId, terminalDndOrderedTerminalIds(nextItems, instanceId));
+  }
+
+  function handleTerminalDndFinalize(event: CustomEvent<DndEvent<TerminalDndItem>>) {
+    const instanceId = terminalDndWorkspaceInstanceId ?? activeWorkspaceInstanceId;
+    beginTerminalDndIfNeeded(instanceId);
+
+    const expectedTerminalCount = visibleTerminalsForWorkspace(instanceId).length;
+    const eventItems = normalizeTerminalDndItems(event.detail.items, instanceId);
+    const nextItems = eventItems.length === expectedTerminalCount ? eventItems : terminalDndItems;
+    const finalTerminalIds = terminalDndOrderedTerminalIds(nextItems, instanceId);
+    const orderChanged = !sameTerminalIdOrder(terminalDndInitialTerminalIds, finalTerminalIds);
+    applyTerminalOrderForWorkspace(instanceId, finalTerminalIds, orderChanged);
+
+    terminalDndActive = false;
+    terminalDndWorkspaceInstanceId = null;
+    terminalDndInitialTerminalIds = [];
+    terminalDndItems = terminalDndItemsForSessions(terminalSessions.filter(terminalIsLayoutVisible));
+  }
+
+  function updateWorkspaceRuntime(
+    instanceId: string,
+    updater: (workspace: WorkspaceRuntime) => WorkspaceRuntime,
+  ) {
+    const nextRunningWorkspaces = runningWorkspaces.map((workspace) =>
+      workspace.instanceId === instanceId ? updater(workspace) : workspace,
+    );
+    const updatedActiveWorkspace = nextRunningWorkspaces.find(
+      (workspace) => workspace.instanceId === activeWorkspaceInstanceId,
+    );
+
+    runningWorkspaces = nextRunningWorkspaces;
+
+    if (instanceId === activeWorkspaceInstanceId && updatedActiveWorkspace) {
+      selectedTerminalId = updatedActiveWorkspace.selectedTerminalId;
+      fullscreenTerminalId = updatedActiveWorkspace.fullscreenTerminalId;
+      cachedTerminalReady = updatedActiveWorkspace.cachedTerminalReady;
+    }
+  }
+
+  function updateActiveWorkspaceRuntime(updater: (workspace: WorkspaceRuntime) => WorkspaceRuntime) {
+    const workspace = ensureActiveWorkspaceRuntime();
+    updateWorkspaceRuntime(workspace.instanceId, updater);
+  }
+
+  function syncActiveWorkspaceRuntime() {
+    updateActiveWorkspaceRuntime((workspace) => ({
+      ...workspace,
+      selectedTerminalId,
+      fullscreenTerminalId,
+      cachedTerminalReady,
+    }));
+  }
+
+  function activateWorkspace(instanceId: string) {
+    const workspace = workspaceRuntimeById(instanceId);
+    if (!workspace) return;
+
+    const visibleTerminals = visibleTerminalsForWorkspace(instanceId);
+    const selectedId = visibleTerminals.some((terminal) => terminal.id === workspace.selectedTerminalId)
+      ? workspace.selectedTerminalId
+      : (visibleTerminals[0]?.id ?? null);
+    const fullscreenId = visibleTerminals.some((terminal) => terminal.id === workspace.fullscreenTerminalId)
+      ? workspace.fullscreenTerminalId
+      : null;
+
+    activeWorkspaceInstanceId = workspace.instanceId;
+    selectedTerminalId = selectedId;
+    fullscreenTerminalId = fullscreenId;
+    cachedTerminalReady = workspace.cachedTerminalReady;
+    updateWorkspaceRuntime(workspace.instanceId, (currentWorkspace) => ({
+      ...currentWorkspace,
+      selectedTerminalId: selectedId,
+      fullscreenTerminalId: fullscreenId,
+    }));
+  }
+
+  function nextUntitledWorkspaceName() {
+    const names = new Set(runningWorkspaces.map((workspace) => workspace.name));
+    if (!names.has("Untitled")) return "Untitled";
+
+    let suffix = 2;
+    while (names.has(`Untitled ${suffix}`)) {
+      suffix += 1;
+    }
+
+    return `Untitled ${suffix}`;
+  }
+
+  function createNewWorkspace() {
+    const workspace = createWorkspaceRuntime({ name: nextUntitledWorkspaceName() });
+    runningWorkspaces = [...runningWorkspaces, workspace];
+    activateWorkspace(workspace.instanceId);
+  }
+
+  function requestCloseWorkspace(instanceId: string) {
+    const workspace = workspaceRuntimeById(instanceId);
+    if (!workspace) return;
+
+    const openTerminals = visibleTerminalsForWorkspace(instanceId);
+    const terminalCount = openTerminals.length;
+    if (openTerminals.some((terminal) => terminal.hasUserInput)) {
+      const shouldClose = window.confirm(
+        `Closing ${workspace.name} will stop ${pluralize(terminalCount, "terminal")} and lose any in-progress work. Close it anyway?`,
+      );
+      if (!shouldClose) return;
+    }
+
+    const workspaceIndex = runningWorkspaces.findIndex((candidate) => candidate.instanceId === instanceId);
+    const wasActive = activeWorkspaceInstanceId === instanceId;
+    let nextRunningWorkspaces = runningWorkspaces.filter(
+      (candidate) => candidate.instanceId !== instanceId,
+    );
+    if (nextRunningWorkspaces.length === 0) {
+      nextRunningWorkspaces = [createWorkspaceRuntime()];
+    }
+
+    terminalSessions = terminalSessions.filter((terminal) => terminal.workspaceInstanceId !== instanceId);
+    runningWorkspaces = nextRunningWorkspaces;
+
+    if (wasActive || !workspaceRuntimeById(activeWorkspaceInstanceId)) {
+      const nextWorkspace = nextRunningWorkspaces[Math.min(workspaceIndex, nextRunningWorkspaces.length - 1)]
+        ?? nextRunningWorkspaces[0];
+      activateWorkspace(nextWorkspace.instanceId);
+    }
+  }
+
   function currentWorkspaceTerminals(): SavedWorkspaceTerminal[] {
     return terminalSessions
-      .filter((terminal) => !terminal.cached && !terminal.closing)
+      .filter(
+        (terminal) =>
+          terminal.workspaceInstanceId === activeWorkspaceInstanceId && !terminal.cached && !terminal.closing,
+      )
       .map((terminal) => ({
         kind: terminal.kind,
         piProfileId: terminal.kind === "pi" ? normalizeProfileId(terminal.piProfileId) : undefined,
@@ -1223,11 +1627,11 @@
   }
 
   function activeWorkspaceName() {
-    return savedWorkspaces.find((workspace) => workspace.id === activeWorkspaceId)?.name ?? "";
+    return activeWorkspaceRuntime()?.name ?? "Untitled";
   }
 
   function activeWorkspaceWorkingDirectory() {
-    return savedWorkspaces.find((workspace) => workspace.id === activeWorkspaceId)?.workingDirectory ?? "";
+    return activeWorkspaceRuntime()?.workingDirectory ?? "";
   }
 
   function displayWorkingDirectory(workingDirectory?: string) {
@@ -1238,13 +1642,36 @@
     return normalizeWorkingDirectory(left) === normalizeWorkingDirectory(right);
   }
 
+  function terminalIsLayoutVisible(terminal: TerminalSession) {
+    return (
+      !terminal.cached &&
+      !terminal.closing &&
+      terminal.workspaceInstanceId === activeWorkspaceInstanceId &&
+      (fullscreenTerminalId === null || terminal.id === fullscreenTerminalId)
+    );
+  }
+
+  function terminalIsSelected(terminal: TerminalSession) {
+    return terminal.workspaceInstanceId === activeWorkspaceInstanceId && selectedTerminalId === terminal.id;
+  }
+
   function migrateOpenTerminalsToWorkingDirectory(workingDirectory?: string) {
+    const workspace = ensureActiveWorkspaceRuntime();
     const normalizedWorkingDirectory = normalizeWorkingDirectory(workingDirectory);
-    const visibleTerminals = terminalSessions.filter((terminal) => !terminal.cached && !terminal.closing);
-    if (visibleTerminals.length === 0) return;
+    const visibleTerminals = visibleTerminalsForWorkspace(workspace.instanceId);
+    if (visibleTerminals.length === 0) {
+      updateActiveWorkspaceRuntime((currentWorkspace) => ({
+        ...currentWorkspace,
+        workingDirectory: normalizedWorkingDirectory || undefined,
+      }));
+      return;
+    }
 
     const hasWorkingDirectoryChange = terminalSessions.some(
-      (terminal) => !terminal.closing && !sameWorkingDirectory(terminal.workingDirectory, normalizedWorkingDirectory),
+      (terminal) =>
+        terminal.workspaceInstanceId === workspace.instanceId &&
+        !terminal.closing &&
+        !sameWorkingDirectory(terminal.workingDirectory, normalizedWorkingDirectory),
     );
     if (!hasWorkingDirectoryChange) return;
 
@@ -1255,24 +1682,39 @@
 
       return {
         id: nextId,
+        workspaceInstanceId: workspace.instanceId,
         cached: false,
         kind: terminal.kind,
         piProfileId: terminal.kind === "pi" ? normalizeProfileId(terminal.piProfileId) : undefined,
         workingDirectory: normalizedWorkingDirectory || undefined,
       };
     });
-    const nextCachedTerminal: TerminalSession = {
-      id: ++nextTerminalId,
-      cached: true,
-      kind: "pi",
-      piProfileId: favoritePiProfileId || DEFAULT_PI_PROFILE_ID,
-      workingDirectory: normalizedWorkingDirectory || undefined,
-    };
+    const nextWorkspaceTerminals = [...migratedTerminals];
+    if (PREWARM_FAVORITE_PI_PROFILE) {
+      nextWorkspaceTerminals.push({
+        id: ++nextTerminalId,
+        workspaceInstanceId: workspace.instanceId,
+        cached: true,
+        kind: "pi",
+        piProfileId: favoritePiProfileId || DEFAULT_PI_PROFILE_ID,
+        workingDirectory: normalizedWorkingDirectory || undefined,
+      });
+    }
 
-    terminalSessions = [...migratedTerminals, nextCachedTerminal];
+    terminalSessions = [
+      ...terminalSessions.filter((terminal) => terminal.workspaceInstanceId !== workspace.instanceId),
+      ...nextWorkspaceTerminals,
+    ];
     selectedTerminalId = selectedTerminalId === null ? null : (terminalIdMap.get(selectedTerminalId) ?? null);
     fullscreenTerminalId = fullscreenTerminalId === null ? null : (terminalIdMap.get(fullscreenTerminalId) ?? null);
     cachedTerminalReady = false;
+    updateActiveWorkspaceRuntime((currentWorkspace) => ({
+      ...currentWorkspace,
+      workingDirectory: normalizedWorkingDirectory || undefined,
+      selectedTerminalId,
+      fullscreenTerminalId,
+      cachedTerminalReady: false,
+    }));
   }
 
   function openSaveWorkspaceDialog() {
@@ -1319,10 +1761,6 @@
     return parts.length > 0 ? parts.join(" · ") : "No terminals";
   }
 
-  function workspaceUsageTimestamp(workspace: SavedWorkspace) {
-    const timestamp = Date.parse(workspace.lastUsedAt || workspace.savedAt);
-    return Number.isNaN(timestamp) ? 0 : timestamp;
-  }
 
   function touchWorkspaceUsage(workspaceId: string) {
     const lastUsedAt = new Date().toISOString();
@@ -1337,35 +1775,77 @@
     const nextSavedWorkspaces = savedWorkspaces.filter((workspace) => workspace.id !== workspaceId);
 
     savedWorkspaces = nextSavedWorkspaces;
-    if (activeWorkspaceId === workspaceId) {
-      activeWorkspaceId = null;
-    }
+    runningWorkspaces = runningWorkspaces.map((workspace) =>
+      workspace.savedWorkspaceId === workspaceId
+        ? { ...workspace, savedWorkspaceId: undefined, dirty: true }
+        : workspace,
+    );
 
     void persistSavedWorkspaces(nextSavedWorkspaces);
   }
 
   function openSavedWorkspace(workspace: SavedWorkspace) {
+    const alreadyRunningWorkspace = runningWorkspaces.find(
+      (runtimeWorkspace) => runtimeWorkspace.savedWorkspaceId === workspace.id,
+    );
+    if (alreadyRunningWorkspace) {
+      activateWorkspace(alreadyRunningWorkspace.instanceId);
+      touchWorkspaceUsage(workspace.id);
+      openWorkspaceDialogOpen = false;
+      return;
+    }
+
+    const reusableWorkspace = activeWorkspaceRuntime();
+    const shouldReuseActiveWorkspace = Boolean(
+      reusableWorkspace &&
+        !reusableWorkspace.savedWorkspaceId &&
+        !reusableWorkspace.dirty &&
+        workspaceTerminalCount(reusableWorkspace.instanceId) === 0,
+    );
+    const instanceId = shouldReuseActiveWorkspace && reusableWorkspace
+      ? reusableWorkspace.instanceId
+      : createWorkspaceInstanceId();
     const workingDirectory = normalizeWorkingDirectory(workspace.workingDirectory);
     const visibleTerminals: TerminalSession[] = workspace.terminals.map((terminal) => ({
       id: ++nextTerminalId,
+      workspaceInstanceId: instanceId,
       cached: false,
       kind: terminal.kind,
       piProfileId: terminal.kind === "pi" ? normalizeProfileId(terminal.piProfileId) : undefined,
       workingDirectory: workingDirectory || undefined,
     }));
-    const nextCachedTerminal: TerminalSession = {
-      id: ++nextTerminalId,
-      cached: true,
-      kind: "pi",
-      piProfileId: favoritePiProfileId || DEFAULT_PI_PROFILE_ID,
-      workingDirectory: workingDirectory || undefined,
-    };
+    const nextWorkspaceTerminals = [...visibleTerminals];
+    if (PREWARM_FAVORITE_PI_PROFILE) {
+      nextWorkspaceTerminals.push({
+        id: ++nextTerminalId,
+        workspaceInstanceId: instanceId,
+        cached: true,
+        kind: "pi",
+        piProfileId: favoritePiProfileId || DEFAULT_PI_PROFILE_ID,
+        workingDirectory: workingDirectory || undefined,
+      });
+    }
 
-    terminalSessions = [...visibleTerminals, nextCachedTerminal];
-    selectedTerminalId = visibleTerminals[0]?.id ?? null;
-    fullscreenTerminalId = null;
-    cachedTerminalReady = false;
-    activeWorkspaceId = workspace.id;
+    terminalSessions = [
+      ...terminalSessions.filter((terminal) =>
+        shouldReuseActiveWorkspace ? terminal.workspaceInstanceId !== instanceId : true,
+      ),
+      ...nextWorkspaceTerminals,
+    ];
+    const runtimeWorkspace = createWorkspaceRuntime({
+      instanceId,
+      savedWorkspaceId: workspace.id,
+      name: workspace.name,
+      workingDirectory: workingDirectory || undefined,
+      selectedTerminalId: visibleTerminals[0]?.id ?? null,
+      cachedTerminalReady: false,
+    });
+    runningWorkspaces = shouldReuseActiveWorkspace
+      ? runningWorkspaces.map((candidate) =>
+          candidate.instanceId === instanceId ? runtimeWorkspace : candidate,
+        )
+      : [...runningWorkspaces, runtimeWorkspace];
+    activateWorkspace(instanceId);
     touchWorkspaceUsage(workspace.id);
     openWorkspaceDialogOpen = false;
   }
@@ -1383,12 +1863,15 @@
     const terminals = currentWorkspaceTerminals();
     if (terminals.length === 0) return;
 
+    const activeRuntime = ensureActiveWorkspaceRuntime();
     const workingDirectory = normalizeWorkingDirectory(workingDirectoryDraft);
     const timestamp = new Date().toISOString();
     const existingByName = savedWorkspaces.find((workspace) => sameWorkspaceName(workspace, name));
-    const activeWorkspace = savedWorkspaces.find((workspace) => workspace.id === activeWorkspaceId);
+    const activeSavedWorkspace = activeRuntime.savedWorkspaceId
+      ? savedWorkspaces.find((workspace) => workspace.id === activeRuntime.savedWorkspaceId)
+      : undefined;
     const targetWorkspaceId =
-      existingByName?.id ?? (activeWorkspace && sameWorkspaceName(activeWorkspace, name) ? activeWorkspace.id : createWorkspaceId());
+      existingByName?.id ?? (activeSavedWorkspace && sameWorkspaceName(activeSavedWorkspace, name) ? activeSavedWorkspace.id : createWorkspaceId());
     const workspace: SavedWorkspace = {
       id: targetWorkspaceId,
       name,
@@ -1410,10 +1893,16 @@
     }
 
     savedWorkspaces = nextSavedWorkspaces;
-    activeWorkspaceId = targetWorkspaceId;
 
     try {
       await persistSavedWorkspaces(nextSavedWorkspaces);
+      updateActiveWorkspaceRuntime((currentWorkspace) => ({
+        ...currentWorkspace,
+        savedWorkspaceId: targetWorkspaceId,
+        name,
+        workingDirectory: workingDirectory || undefined,
+        dirty: false,
+      }));
       migrateOpenTerminalsToWorkingDirectory(workingDirectory);
       saveWorkspaceDialogOpen = false;
       workspaceNameDraft = "";
@@ -1424,7 +1913,8 @@
   }
 
   function spawnTerminal(profileId = favoritePiProfileId, allowCold = false) {
-    const workingDirectory = activeWorkspaceWorkingDirectory();
+    const workspace = ensureActiveWorkspaceRuntime();
+    const workingDirectory = normalizeWorkingDirectory(workspace.workingDirectory);
     const normalizedProfileId = normalizeProfileId(profileId);
     const favoriteProfileId = favoritePiProfileId || DEFAULT_PI_PROFILE_ID;
 
@@ -1440,6 +1930,7 @@
     const cachedTerminal = PREWARM_FAVORITE_PI_PROFILE
       ? terminalSessions.find(
           (terminal) =>
+            terminal.workspaceInstanceId === workspace.instanceId &&
             terminal.cached &&
             sameWorkingDirectory(terminal.workingDirectory, workingDirectory) &&
             samePiProfile(terminal.piProfileId, normalizedProfileId),
@@ -1449,19 +1940,23 @@
     if (!cachedTerminal) {
       const nextVisibleTerminal: TerminalSession = {
         id: ++nextTerminalId,
+        workspaceInstanceId: workspace.instanceId,
         cached: false,
         kind: "pi",
         piProfileId: normalizedProfileId,
         workingDirectory: workingDirectory || undefined,
       };
       const nextTerminalSessions = [
-        ...terminalSessions.filter((terminal) => !terminal.cached),
+        ...terminalSessions.filter(
+          (terminal) => !(terminal.workspaceInstanceId === workspace.instanceId && terminal.cached),
+        ),
         nextVisibleTerminal,
       ];
 
       if (PREWARM_FAVORITE_PI_PROFILE) {
         nextTerminalSessions.push({
           id: ++nextTerminalId,
+          workspaceInstanceId: workspace.instanceId,
           cached: true,
           kind: "pi",
           piProfileId: favoriteProfileId,
@@ -1474,29 +1969,44 @@
       selectedTerminalId = nextVisibleTerminal.id;
     } else {
       terminalSessions = terminalSessions
-        .filter((terminal) => !terminal.cached || terminal.id === cachedTerminal.id)
+        .filter(
+          (terminal) =>
+            !(terminal.workspaceInstanceId === workspace.instanceId && terminal.cached && terminal.id !== cachedTerminal.id),
+        )
         .map((terminal) => (terminal.id === cachedTerminal.id ? { ...terminal, cached: false } : terminal));
-      terminalSessions = [
-        ...terminalSessions,
-        {
-          id: ++nextTerminalId,
-          cached: true,
-          kind: "pi",
-          piProfileId: favoriteProfileId,
-          workingDirectory: workingDirectory || undefined,
-        },
-      ];
+      if (PREWARM_FAVORITE_PI_PROFILE) {
+        terminalSessions = [
+          ...terminalSessions,
+          {
+            id: ++nextTerminalId,
+            workspaceInstanceId: workspace.instanceId,
+            cached: true,
+            kind: "pi",
+            piProfileId: favoriteProfileId,
+            workingDirectory: workingDirectory || undefined,
+          },
+        ];
+      }
       selectedTerminalId = cachedTerminal.id;
       cachedTerminalReady = false;
     }
 
     fullscreenTerminalId = null;
+    updateActiveWorkspaceRuntime((currentWorkspace) => ({
+      ...currentWorkspace,
+      selectedTerminalId,
+      fullscreenTerminalId: null,
+      cachedTerminalReady,
+      dirty: true,
+    }));
   }
 
   function spawnEmptyTerminal() {
-    const workingDirectory = activeWorkspaceWorkingDirectory();
+    const workspace = ensureActiveWorkspaceRuntime();
+    const workingDirectory = normalizeWorkingDirectory(workspace.workingDirectory);
     const terminal: TerminalSession = {
       id: ++nextTerminalId,
+      workspaceInstanceId: workspace.instanceId,
       cached: false,
       kind: "shell",
       workingDirectory: workingDirectory || undefined,
@@ -1504,19 +2014,28 @@
     terminalSessions = [...terminalSessions, terminal];
     selectedTerminalId = terminal.id;
     fullscreenTerminalId = null;
+    updateActiveWorkspaceRuntime((currentWorkspace) => ({
+      ...currentWorkspace,
+      selectedTerminalId: terminal.id,
+      fullscreenTerminalId: null,
+      dirty: true,
+    }));
   }
   function handleTerminalReady(id: number) {
     const session = terminalSessions.find((terminal) => terminal.id === id);
 
     if (PREWARM_FAVORITE_PI_PROFILE && session?.cached && samePiProfile(session.piProfileId, favoritePiProfileId)) {
-      cachedTerminalReady = true;
+      updateWorkspaceRuntime(session.workspaceInstanceId, (workspace) => ({
+        ...workspace,
+        cachedTerminalReady: true,
+      }));
     }
   }
   function handleTerminalUserInput(id: number) {
-    terminalSessions = terminalSessions.map((terminal) =>
-      terminal.id === id && !terminal.cached && !terminal.hasUserInput
-        ? { ...terminal, hasUserInput: true }
-        : terminal,
+    terminalSessions = terminalSessions.map((candidate) =>
+      candidate.id === id && !candidate.cached && !candidate.hasUserInput
+        ? { ...candidate, hasUserInput: true }
+        : candidate,
     );
   }
 
@@ -1540,17 +2059,21 @@
   }
 
   function closeTerminal(id: number) {
-    terminalSessions = terminalSessions.map((terminal) =>
-      terminal.id === id && !terminal.cached ? { ...terminal, closing: true } : terminal,
+    const terminal = terminalSessions.find(
+      (candidate) => candidate.id === id && !candidate.cached && !candidate.closing,
+    );
+    if (!terminal) return;
+
+    terminalSessions = terminalSessions.map((candidate) =>
+      candidate.id === id && !candidate.cached ? { ...candidate, closing: true } : candidate,
     );
 
-    if (selectedTerminalId === id) {
-      selectedTerminalId = null;
-    }
-
-    if (fullscreenTerminalId === id) {
-      fullscreenTerminalId = null;
-    }
+    updateWorkspaceRuntime(terminal.workspaceInstanceId, (workspace) => ({
+      ...workspace,
+      selectedTerminalId: workspace.selectedTerminalId === id ? null : workspace.selectedTerminalId,
+      fullscreenTerminalId: workspace.fullscreenTerminalId === id ? null : workspace.fullscreenTerminalId,
+      dirty: true,
+    }));
   }
 
   function requestCloseTerminal(id: number) {
@@ -1571,7 +2094,10 @@
   function closeNewestTerminal() {
     const newestTerminal = [...terminalSessions]
       .reverse()
-      .find((terminal) => !terminal.cached && !terminal.closing);
+      .find(
+        (terminal) =>
+          terminal.workspaceInstanceId === activeWorkspaceInstanceId && !terminal.cached && !terminal.closing,
+      );
 
     if (newestTerminal) {
       requestCloseTerminal(newestTerminal.id);
@@ -1580,7 +2106,11 @@
 
   function closeSelectedOrNewestTerminal() {
     const selectedTerminal = terminalSessions.find(
-      (terminal) => terminal.id === selectedTerminalId && !terminal.cached && !terminal.closing,
+      (terminal) =>
+        terminal.workspaceInstanceId === activeWorkspaceInstanceId &&
+        terminal.id === selectedTerminalId &&
+        !terminal.cached &&
+        !terminal.closing,
     );
 
     if (selectedTerminal) {
@@ -1594,34 +2124,45 @@
   function toggleFullscreenSelectedTerminal() {
     if (fullscreenTerminalId !== null) {
       fullscreenTerminalId = null;
+      syncActiveWorkspaceRuntime();
       return;
     }
 
     if (activeTerminalCount <= 1) return;
 
     const selectedTerminal = terminalSessions.find(
-      (terminal) => terminal.id === selectedTerminalId && !terminal.cached && !terminal.closing,
+      (terminal) =>
+        terminal.workspaceInstanceId === activeWorkspaceInstanceId &&
+        terminal.id === selectedTerminalId &&
+        !terminal.cached &&
+        !terminal.closing,
     );
 
     if (selectedTerminal) {
       fullscreenTerminalId = selectedTerminal.id;
+      syncActiveWorkspaceRuntime();
     }
   }
   function selectTerminal(id: number) {
     const terminal = terminalSessions.find((terminal) => terminal.id === id);
 
     if (terminal && !terminal.cached && !terminal.closing) {
+      if (terminal.workspaceInstanceId !== activeWorkspaceInstanceId) {
+        activateWorkspace(terminal.workspaceInstanceId);
+      }
       selectedTerminalId = id;
+      syncActiveWorkspaceRuntime();
     }
   }
   function handleTerminalClosed(id: number) {
-    terminalSessions = terminalSessions.filter((terminal) => terminal.cached || terminal.id !== id);
-    if (selectedTerminalId === id) {
-      selectedTerminalId = null;
-    }
-
-    if (fullscreenTerminalId === id) {
-      fullscreenTerminalId = null;
+    const terminal = terminalSessions.find((candidate) => candidate.id === id);
+    terminalSessions = terminalSessions.filter((candidate) => candidate.cached || candidate.id !== id);
+    if (terminal) {
+      updateWorkspaceRuntime(terminal.workspaceInstanceId, (workspace) => ({
+        ...workspace,
+        selectedTerminalId: workspace.selectedTerminalId === id ? null : workspace.selectedTerminalId,
+        fullscreenTerminalId: workspace.fullscreenTerminalId === id ? null : workspace.fullscreenTerminalId,
+      }));
     }
 
     if (pendingCloseTerminalId === id) {
@@ -2396,7 +2937,7 @@
 </Dialog.Root>
 
 {#if appUpdateMessage}
-  <div class="mx-2 flex shrink-0 items-center justify-between gap-3 rounded-md border border-border bg-muted/60 px-3 py-2 text-xs text-muted-foreground">
+  <div class="flex w-full shrink-0 items-center justify-between gap-2 border-b border-border bg-muted/60 px-2 py-1 text-xs text-muted-foreground">
     <span class="min-w-0 truncate">{appUpdateMessage}</span>
     <Button
       variant="ghost"
@@ -2409,81 +2950,194 @@
     </Button>
   </div>
 {/if}
-<div class="terminal-grid min-h-0 flex-1 overflow-auto p-2">
-  {#each terminalSessions as terminal (terminal.id)}
-    <div
-      class={terminal.cached
-        ? "pointer-events-none fixed left-0 top-0 flex h-[24rem] w-[960px] -translate-x-[200vw] flex-col opacity-0"
-        : fullscreenTerminalId !== null && terminal.id !== fullscreenTerminalId
-          ? "pointer-events-none fixed left-0 top-0 flex h-[24rem] w-[960px] -translate-x-[200vw] flex-col opacity-0"
-          : `relative flex min-h-0 flex-col ${selectedTerminalId === terminal.id ? "z-10" : "z-0"}`}
-      aria-hidden={terminal.cached || (fullscreenTerminalId !== null && terminal.id !== fullscreenTerminalId)}
-      onclick={() => selectTerminal(terminal.id)}
-    >
+<div class="flex w-full shrink-0 items-center gap-1 overflow-hidden border-b border-border bg-muted/30 px-2 py-1 text-xs text-muted-foreground">
+  <div class="flex min-w-0 flex-1 items-center overflow-x-auto">
+    {#each runningWorkspaces as workspace, index (workspace.instanceId)}
+      {#if index > 0}
+        <Separator orientation="vertical" class="mx-1 h-5 shrink-0" />
+      {/if}
 
-      <WTermTerminal
-        id={terminal.id}
-        kind={terminal.kind}
-        piProfileId={terminal.kind === "pi" ? normalizeProfileId(terminal.piProfileId) : undefined}
-        piProfileName={terminal.kind === "pi" ? profileDisplayName(terminal.piProfileId) : undefined}
-        workingDirectory={terminal.workingDirectory}
-        autoFocus={selectedTerminalId === terminal.id && !terminal.cached && !terminal.closing}
-        closing={terminal.closing}
-        layoutActive={!terminal.cached && (fullscreenTerminalId === null || terminal.id === fullscreenTerminalId)}
-        layoutKey={terminalLayoutKey}
-        onReady={handleTerminalReady}
-        onClosed={handleTerminalClosed}
-        onUserInput={handleTerminalUserInput}
-        onClose={terminal.cached ? undefined : () => void requestCloseTerminal(terminal.id)}
-        closeDisabled={terminal.closing}
-        onSelect={() => selectTerminal(terminal.id)}
-
-        selected={selectedTerminalId === terminal.id}
-      />
-    </div>
-  {/each}
-
-  {#if activeTerminalCount === 0}
-    <div class="col-span-full relative flex h-full min-h-0 flex-col p-6 text-center text-sm text-muted-foreground">
-      <div class="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-5 p-6">
-        <div class="relative h-80 w-[min(68rem,100%)] select-none overflow-hidden sm:h-96 md:h-[28rem]" role="img" aria-label="PIOC">
-          <ASCIIText text="PIOC" asciiFontSize={7} textFontSize={380} gradientColors={homeAsciiPalette.gradient} planeBaseHeight={16} enableWaves={true} waveStrength={0.35} interactive={false} onTextClick={cycleHomeAsciiPalette} />
-        </div>
-        <p>
-          <HotkeyList items={emptyPageHotkeyHints()} />
-        </p>
+      <div class="flex min-w-0 shrink-0 items-center">
+        <Button
+          variant="ghost"
+          size="sm"
+          type="button"
+          class={workspace.instanceId === activeWorkspaceInstanceId
+            ? "h-7 min-w-0 max-w-52 justify-start gap-1.5 px-2 font-medium text-foreground"
+            : "h-7 min-w-0 max-w-52 justify-start gap-1.5 px-2 text-muted-foreground"}
+          aria-current={workspace.instanceId === activeWorkspaceInstanceId ? "page" : undefined}
+          onclick={() => activateWorkspace(workspace.instanceId)}
+        >
+          <span class="truncate">{workspace.name}</span>
+          {#if workspace.dirty}
+            <span class="text-primary" aria-label="Unsaved changes">•</span>
+          {/if}
+          <span class="shrink-0 text-muted-foreground">{workspaceTerminalCount(workspace.instanceId)}</span>
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          type="button"
+          class="h-7 px-1.5 text-muted-foreground"
+          aria-label={`Close workspace ${workspace.name}`}
+          title={`Close ${workspace.name}`}
+          onclick={(event) => {
+            event.stopPropagation();
+            requestCloseWorkspace(workspace.instanceId);
+          }}
+        >
+          ×
+        </Button>
       </div>
+    {/each}
+  </div>
 
-      {#if recentWorkspaces.length > 0}
-        <section class="relative z-10 mt-auto flex w-full justify-center text-left">
-          <div class="flex max-w-full items-center justify-center gap-3 overflow-hidden">
-            {#each recentWorkspaces as workspace, index (workspace.id)}
-              {#if index > 0}
-                <Separator orientation="vertical" class="h-8" />
-              {/if}
+  <Separator orientation="vertical" class="h-6" />
 
-              <Button
-                variant="ghost"
-                class="h-auto w-40 shrink-0 flex-col items-start justify-start gap-0.5 px-2 py-1.5 text-left whitespace-normal"
-                onclick={() => openSavedWorkspace(workspace)}
-              >
-                <span class="w-full truncate font-medium text-foreground">{workspace.name}</span>
-                <span class="w-full truncate text-muted-foreground">{displayWorkingDirectory(workspace.workingDirectory)}</span>
-                <span class="w-full truncate text-muted-foreground">{workspaceSummary(workspace)}</span>
-              </Button>
-            {/each}
+  <div class="flex shrink-0 items-center gap-1">
+    <Button variant="ghost" size="sm" type="button" class="h-7 px-2" onclick={createNewWorkspace}>New</Button>
+    <Button
+      variant="ghost"
+      size="sm"
+      type="button"
+      class="h-7 px-2"
+      disabled={!workspacePersistenceReady || savedWorkspaces.length === 0}
+      onclick={openWorkspaceDialog}
+    >
+      Open
+    </Button>
+    <Button
+      variant="ghost"
+      size="sm"
+      type="button"
+      class="h-7 px-2"
+      disabled={!workspacePersistenceReady || activeTerminalCount === 0}
+      onclick={openSaveWorkspaceDialog}
+    >
+      Save
+    </Button>
+  </div>
+</div>
+
+<div class="min-h-0 flex-1 overflow-auto px-1.5 pb-2 pt-1">
+  <div class="terminal-layout-stack relative h-full min-h-full">
+    <div class="terminal-grid terminal-grid-content h-full min-h-full">
+      {#each terminalSessions as terminal (terminal.id)}
+        <div
+          animate:flip={{ duration: TERMINAL_DND_FLIP_DURATION_MS }}
+          class={!terminalIsLayoutVisible(terminal)
+            ? "pointer-events-none fixed left-0 top-0 flex h-[24rem] w-[960px] -translate-x-[200vw] flex-col opacity-0"
+            : `relative flex min-h-0 flex-col ${terminalIsSelected(terminal) ? "z-10" : "z-0"}`}
+          aria-hidden={!terminalIsLayoutVisible(terminal)}
+          onclick={() => selectTerminal(terminal.id)}
+        >
+          <WTermTerminal
+            id={terminal.id}
+            kind={terminal.kind}
+            piProfileId={terminal.kind === "pi" ? normalizeProfileId(terminal.piProfileId) : undefined}
+            piProfileName={terminal.kind === "pi" ? profileDisplayName(terminal.piProfileId) : undefined}
+            workingDirectory={terminal.workingDirectory}
+            autoFocus={terminalIsSelected(terminal) && !terminal.cached && !terminal.closing}
+            closing={terminal.closing}
+            layoutActive={terminalIsLayoutVisible(terminal)}
+            layoutKey={terminalLayoutKey}
+            onReady={handleTerminalReady}
+            onClosed={handleTerminalClosed}
+            onUserInput={handleTerminalUserInput}
+            onClose={terminal.cached ? undefined : () => void requestCloseTerminal(terminal.id)}
+            closeDisabled={terminal.closing}
+            onSelect={() => selectTerminal(terminal.id)}
+            selected={terminalIsSelected(terminal)}
+          />
+        </div>
+      {/each}
+
+      {#if activeTerminalCount === 0}
+        <div class="col-span-full relative flex h-full min-h-0 items-center justify-center p-6">
+          <div class="relative h-80 w-[min(68rem,100%)] select-none overflow-hidden sm:h-96 md:h-[28rem]" role="img" aria-label="PIOC">
+            <ASCIIText text="PIOC" asciiFontSize={7} textFontSize={380} gradientColors={homeAsciiPalette.gradient} planeBaseHeight={16} enableWaves={true} waveStrength={0.35} interactive={false} onTextClick={cycleHomeAsciiPalette} />
           </div>
-        </section>
+        </div>
       {/if}
     </div>
-  {/if}
+
+    {#if terminalDndEnabled}
+      <div
+        class="terminal-grid terminal-dnd-grid pointer-events-none absolute inset-0 z-20"
+        use:dragHandleZone={terminalDndOptions}
+        onconsider={handleTerminalDndConsider}
+        onfinalize={handleTerminalDndFinalize}
+        aria-label="Terminal layout order"
+      >
+        {#each terminalDndItems as item (item.id)}
+          <div
+            animate:flip={{ duration: TERMINAL_DND_FLIP_DURATION_MS }}
+            class={cn(
+              "terminal-dnd-cell pointer-events-none relative min-h-0",
+              terminalDndItemIsShadow(item) && "terminal-dnd-shadow",
+              selectedTerminalId === item.terminalId && "terminal-dnd-cell-selected",
+            )}
+            data-is-dnd-shadow-item-hint={terminalDndItemIsShadow(item) ? "true" : undefined}
+            aria-label={terminalDndItemLabel(item)}
+          >
+            {#if !terminalDndItemIsShadow(item)}
+              <button
+                use:dragHandle
+                type="button"
+                class="terminal-dnd-handle pointer-events-auto absolute left-1/2 top-2 inline-flex size-7 -translate-x-1/2 items-center justify-center rounded-sm border border-border/80 bg-background/90 text-muted-foreground opacity-0 shadow-sm backdrop-blur transition hover:border-ring/60 hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                aria-label={`Move ${terminalDndItemLabel(item)}`}
+                title="Drag to rearrange terminal"
+                onpointerdown={(event) => {
+                  event.stopPropagation();
+                  selectTerminal(item.terminalId);
+                }}
+                onclick={(event) => event.stopPropagation()}
+              >
+                <RiDragMove2Line aria-hidden="true" />
+              </button>
+            {/if}
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </div>
 </div>
 
 <style>
   .terminal-grid {
     display: grid;
-    gap: 1rem;
+    gap: 0.75rem;
     grid-auto-rows: minmax(14rem, 1fr);
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 24rem), 1fr));
+  }
+
+  .terminal-layout-stack {
+    isolation: isolate;
+  }
+
+  .terminal-dnd-cell {
+    border: 1px solid transparent;
+  }
+
+  .terminal-layout-stack:hover .terminal-dnd-handle,
+  .terminal-dnd-cell-selected .terminal-dnd-handle,
+  .terminal-dnd-handle:focus-visible,
+  :global(#dnd-action-dragged-el) .terminal-dnd-handle {
+    opacity: 1;
+  }
+
+  .terminal-dnd-handle {
+    cursor: grab;
+  }
+
+  .terminal-dnd-handle:active,
+  :global(#dnd-action-dragged-el) .terminal-dnd-handle {
+    cursor: grabbing;
+  }
+
+  .terminal-dnd-shadow {
+    border-color: color-mix(in oklab, var(--ring) 70%, transparent);
+    background: color-mix(in oklab, var(--ring) 12%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--ring) 25%, transparent);
   }
 </style>

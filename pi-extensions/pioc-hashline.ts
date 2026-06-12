@@ -8,7 +8,7 @@ import { resolve } from "node:path";
 // PIOC bundled fork of @jerryan/pi-hashline-edit.
 // Kept self-contained so desktop builds can load it without installing npm package deps.
 
-const PACKAGE = { name: "pioc-hashline", version: "0.1.0" };
+const PACKAGE = { name: "pioc-hashline", version: "0.1.1" };
 const DEFAULT_LIMIT = 2000;
 const MAX_OUTPUT_BYTES = 50 * 1024;
 const ANCHOR_SEP = "#";
@@ -68,8 +68,73 @@ function extensionOf(path: string): string {
   return match?.[0] ?? "";
 }
 
-function imageMimeType(path: string): string | undefined {
+function imageMimeTypeFromExtension(path: string): string | undefined {
   return IMAGE_MIME_BY_EXTENSION[extensionOf(path)];
+}
+
+function startsWith(buffer: Buffer, bytes: number[]): boolean {
+  if (buffer.length < bytes.length) return false;
+  return bytes.every((byte, index) => buffer[index] === byte);
+}
+
+function startsWithAscii(buffer: Buffer, offset: number, text: string): boolean {
+  if (buffer.length < offset + text.length) return false;
+  for (let index = 0; index < text.length; index++) {
+    if (buffer[offset + index] !== text.charCodeAt(index)) return false;
+  }
+  return true;
+}
+
+function readUint32BE(buffer: Buffer, offset: number): number {
+  return (
+    ((buffer[offset] ?? 0) * 0x1000000) +
+    ((buffer[offset + 1] ?? 0) << 16) +
+    ((buffer[offset + 2] ?? 0) << 8) +
+    (buffer[offset + 3] ?? 0)
+  );
+}
+
+function isPng(buffer: Buffer): boolean {
+  return buffer.length >= 16 && readUint32BE(buffer, 8) === 13 && startsWithAscii(buffer, 12, "IHDR");
+}
+
+function isAnimatedPng(buffer: Buffer): boolean {
+  let offset = 8;
+  while (offset + 8 <= buffer.length) {
+    const chunkLength = readUint32BE(buffer, offset);
+    const chunkTypeOffset = offset + 4;
+    if (startsWithAscii(buffer, chunkTypeOffset, "acTL")) return true;
+    if (startsWithAscii(buffer, chunkTypeOffset, "IDAT")) return false;
+
+    const nextOffset = offset + 8 + chunkLength + 4;
+    if (nextOffset <= offset || nextOffset > buffer.length) return false;
+    offset = nextOffset;
+  }
+  return false;
+}
+
+function imageMimeTypeFromBuffer(buffer: Buffer): string | undefined {
+  if (startsWith(buffer, [0xff, 0xd8, 0xff])) return buffer[3] === 0xf7 ? undefined : "image/jpeg";
+  if (startsWith(buffer, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) {
+    return isPng(buffer) && !isAnimatedPng(buffer) ? "image/png" : undefined;
+  }
+  if (startsWithAscii(buffer, 0, "GIF")) return "image/gif";
+  if (startsWithAscii(buffer, 0, "RIFF") && startsWithAscii(buffer, 8, "WEBP")) return "image/webp";
+  return undefined;
+}
+
+function imageMimeType(path: string, buffer?: Buffer): string | undefined {
+  return imageMimeTypeFromExtension(path) ?? (buffer ? imageMimeTypeFromBuffer(buffer) : undefined);
+}
+
+function readWithBuiltInRead(params: ReadParams, ctx: ExtensionContext, displayPath: string, toolCallId: string, signal: AbortSignal | undefined, onUpdate: unknown) {
+  const originalRead = createReadTool(ctx.cwd);
+  return originalRead.execute(
+    toolCallId,
+    { path: displayPath, offset: params.offset, limit: params.limit },
+    signal,
+    onUpdate as never,
+  );
 }
 
 function isProbablyBinary(buffer: Buffer): boolean {
@@ -328,25 +393,16 @@ function buildEditResponse(displayPath: string, original: string, next: string, 
 
 async function readTextOrImage(params: ReadParams, ctx: ExtensionContext, toolCallId: string, signal: AbortSignal | undefined, onUpdate: unknown) {
   const displayPath = stripAt(params.path);
-  const absolutePath = resolve(ctx.cwd, displayPath);
-  const buffer = await readFile(absolutePath);
-  const mimeType = imageMimeType(displayPath);
 
-  if (mimeType) {
-    return {
-      content: [{ type: "image" as const, source: { type: "base64" as const, mediaType: mimeType, data: buffer.toString("base64") } }],
-      details: { path: displayPath, package: PACKAGE },
-    };
+  if (imageMimeType(displayPath)) {
+    return readWithBuiltInRead(params, ctx, displayPath, toolCallId, signal, onUpdate);
   }
 
-  if (isProbablyBinary(buffer)) {
-    const originalRead = createReadTool(ctx.cwd);
-    return originalRead.execute(
-      toolCallId,
-      { path: params.path, offset: params.offset, limit: params.limit },
-      signal,
-      onUpdate as never,
-    );
+  const absolutePath = resolve(ctx.cwd, displayPath);
+  const buffer = await readFile(absolutePath);
+
+  if (imageMimeType(displayPath, buffer) || isProbablyBinary(buffer)) {
+    return readWithBuiltInRead(params, ctx, displayPath, toolCallId, signal, onUpdate);
   }
 
   const formatted = formatReadOutput(displayPath, buffer.toString("utf8"), params);
@@ -426,8 +482,14 @@ export default function piocHashline(pi: ExtensionAPI) {
     },
     renderResult(result, { expanded, isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Reading..."), 0, 0);
+      const image = result.content.find((item) => item?.type === "image") as { mimeType?: string } | undefined;
+      if (image) {
+        let text = theme.fg("success", "Image loaded");
+        if (image.mimeType) text += theme.fg("dim", ` ${image.mimeType}`);
+        return new Text(text, 0, 0);
+      }
+
       const first = result.content[0];
-      if (first?.type === "image") return new Text(theme.fg("success", "Image loaded"), 0, 0);
       if (first?.type !== "text") return new Text(theme.fg("error", "No readable content"), 0, 0);
 
       const details = result.details as { path?: string; totalLines?: number; shownStartLine?: number; shownEndLine?: number; truncated?: boolean } | undefined;
