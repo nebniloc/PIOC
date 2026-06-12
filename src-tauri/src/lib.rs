@@ -25,6 +25,9 @@ const SHARED_ADDONS_DIR_NAME: &str = "pi-addons";
 const PIOC_CONTROL_DIR_NAME: &str = "pioc-control";
 const PIOC_CONTROL_EXTENSION_FILE: &str = "pioc-control.ts";
 const PIOC_CONTROL_EXTENSION_SOURCE: &str = include_str!("../../pi-extensions/pioc-control.ts");
+const PIOC_HASHLINE_DIR_NAME: &str = "pioc-hashline";
+const PIOC_HASHLINE_EXTENSION_FILE: &str = "pioc-hashline.ts";
+const PIOC_HASHLINE_EXTENSION_SOURCE: &str = include_str!("../../pi-extensions/pioc-hashline.ts");
 const PROFILE_META_FILE: &str = "profile-meta.json";
 const PROFILE_SETTINGS_FILE: &str = "settings.json";
 const PROFILE_AUTH_FILE: &str = "auth.json";
@@ -328,6 +331,24 @@ fn ensure_pioc_control_extension(app: &AppHandle) -> Result<PathBuf, String> {
     fs::write(&path, PIOC_CONTROL_EXTENSION_SOURCE).map_err(|error| {
         format!(
             "unable to write PIOC control extension {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
+fn pioc_hashline_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app_data_dir(app)?.join(PIOC_HASHLINE_DIR_NAME);
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("unable to create PIOC hashline directory: {error}"))?;
+    Ok(dir)
+}
+
+fn ensure_pioc_hashline_extension(app: &AppHandle) -> Result<PathBuf, String> {
+    let path = pioc_hashline_dir(app)?.join(PIOC_HASHLINE_EXTENSION_FILE);
+    fs::write(&path, PIOC_HASHLINE_EXTENSION_SOURCE).map_err(|error| {
+        format!(
+            "unable to write PIOC hashline extension {}: {error}",
             path.display()
         )
     })?;
@@ -3935,9 +3956,19 @@ fn pty_start(
                     return;
                 }
             };
+            let hashline_extension_path = match ensure_pioc_hashline_extension(&app) {
+                Ok(path) => path,
+                Err(error) => {
+                    mark_profile_exited(&app.state::<PtyState>(), &profile.id);
+                    emit_start_error(&app, id, error);
+                    return;
+                }
+            };
 
             command.arg("--extension");
             command.arg(control_extension_path.as_os_str());
+            command.arg("--extension");
+            command.arg(hashline_extension_path.as_os_str());
 
             let _ = fs::remove_file(&control_paths.telemetry_path);
             let _ = fs::write(&control_paths.command_path, b"");
