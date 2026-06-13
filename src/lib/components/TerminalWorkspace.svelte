@@ -469,7 +469,14 @@
       disabled: appUpdateDisabled(),
       run: () => void checkForAppUpdate(),
     },
-
+    {
+      id: "app.open-diagnostics-log",
+      title: "Open diagnostics log",
+      description: "Open the verbose PIOC log for bug reports.",
+      group: "App",
+      keywords: ["diagnostics", "logs", "bug", "report", "pi", "update"],
+      run: () => void openDiagnosticLog(),
+    },
   ] satisfies CommandPaletteCommand[]);
   $effect(() => {
     const hotkeys: string[] = [];
@@ -709,6 +716,14 @@
     }
   }
 
+  async function openDiagnosticLog() {
+    try {
+      const path = await invoke<string>("pioc_diagnostic_log_open");
+      appUpdateMessage = `Diagnostics log opened: ${path}`;
+    } catch (error) {
+      appUpdateMessage = error instanceof Error ? error.message : String(error);
+    }
+  }
   function resetProfileSettingsDrafts(profile?: PiProfile | null) {
     profileShowThinkingBlocksDraft = !(profile?.hideThinkingBlock ?? false);
     profileThemeDraft = profile?.theme ?? "";

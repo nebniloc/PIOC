@@ -1,6 +1,8 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use fs2::FileExt;
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{
+    native_pty_system, Child, CommandBuilder, ExitStatus as PtyExitStatus, MasterPty, PtySize,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -61,6 +63,8 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const PI_PACKAGE_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PI_PACKAGE_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PI_STARTUP_UPDATE_LOCK_FILE: &str = "pi-startup-update.lock";
+const DIAGNOSTIC_LOG_FILE: &str = "pioc-diagnostics.log";
+const DIAGNOSTIC_LOG_VALUE_LIMIT: usize = 24 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -184,6 +188,15 @@ enum PtyKind {
     Shell,
 }
 
+impl PtyKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            PtyKind::Pi => "pi",
+            PtyKind::Shell => "shell",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PtyStartRequest {
@@ -252,6 +265,76 @@ fn now_millis_string() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().to_string())
         .unwrap_or_else(|_| "0".to_string())
+}
+
+fn diagnostic_log_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_data_dir(app)?.join(DIAGNOSTIC_LOG_FILE))
+}
+
+fn truncate_log_text(value: &str) -> String {
+    if value.len() <= DIAGNOSTIC_LOG_VALUE_LIMIT {
+        return value.to_string();
+    }
+
+    let mut truncated = value
+        .chars()
+        .take(DIAGNOSTIC_LOG_VALUE_LIMIT)
+        .collect::<String>();
+    truncated.push_str("… [truncated]");
+    truncated
+}
+
+fn append_diagnostic_log(app: &AppHandle, scope: &str, message: impl AsRef<str>) {
+    let path = match diagnostic_log_path(app) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("unable to resolve PIOC diagnostics log path: {error}");
+            return;
+        }
+    };
+
+    if let Some(parent) = path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            eprintln!("unable to create PIOC diagnostics log directory: {error}");
+            return;
+        }
+    }
+
+    let timestamp = now_string();
+    let message = truncate_log_text(message.as_ref());
+    let mut entry = String::new();
+    let mut wrote_line = false;
+    for line in message.lines() {
+        wrote_line = true;
+        entry.push_str(&timestamp);
+        entry.push_str(" [");
+        entry.push_str(scope);
+        entry.push_str("] ");
+        entry.push_str(line);
+        entry.push('\n');
+    }
+
+    if !wrote_line {
+        entry.push_str(&timestamp);
+        entry.push_str(" [");
+        entry.push_str(scope);
+        entry.push_str("]\n");
+    }
+
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(entry.as_bytes()) {
+                eprintln!(
+                    "unable to write PIOC diagnostics log {}: {error}",
+                    path.display()
+                );
+            }
+        }
+        Err(error) => eprintln!(
+            "unable to open PIOC diagnostics log {}: {error}",
+            path.display()
+        ),
+    }
 }
 
 fn unix_seconds_to_iso(value: &str) -> Option<String> {
@@ -2796,6 +2879,20 @@ fn find_pi_cmd_shim() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
+fn resolve_cmd_shim_path(shim_dir: &Path, value: &str) -> PathBuf {
+    if let Some(relative_path) = value.trim().strip_prefix("%~dp0") {
+        shim_dir.join(relative_path.trim_start_matches(['\\', '/']))
+    } else {
+        PathBuf::from(value.trim())
+    }
+}
+
+#[cfg(windows)]
+fn command_path_available(path: &Path) -> bool {
+    path.is_file() || path.components().count() == 1
+}
+
+#[cfg(windows)]
 fn parse_pi_cmd_shim(shim_path: &Path) -> Option<(PathBuf, PathBuf, Option<String>)> {
     let shim = fs::read_to_string(shim_path).ok()?;
     let shim_dir = shim_path.parent()?;
@@ -2808,25 +2905,30 @@ fn parse_pi_cmd_shim(shim_path: &Path) -> Option<(PathBuf, PathBuf, Option<Strin
 
     let (node_path, cli_path) = shim.lines().find_map(|line| {
         let line = line.trim();
-        let rest = line.strip_prefix("@\"")?;
-        let node_end = rest.find('"')?;
-        let node_path = PathBuf::from(&rest[..node_end]);
-        let rest = rest[node_end + 1..].trim_start();
-        let cli = rest.strip_prefix('"')?;
-        let cli_end = cli.find('"')?;
-        let cli = &cli[..cli_end];
-        let cli_path = if let Some(relative_cli) = cli.strip_prefix("%~dp0") {
-            shim_dir.join(relative_cli.trim_start_matches(['\\', '/']))
-        } else {
-            PathBuf::from(cli)
-        };
+        if !line.contains("%*") {
+            return None;
+        }
+
+        let quoted_segments = line.split('"').skip(1).step_by(2).collect::<Vec<_>>();
+        let cli_segment = quoted_segments
+            .iter()
+            .rev()
+            .copied()
+            .find(|segment| segment.ends_with(".js"))?;
+        let cli_path = resolve_cmd_shim_path(shim_dir, cli_segment);
+        let node_path = quoted_segments
+            .iter()
+            .copied()
+            .find(|segment| *segment != cli_segment)
+            .map(|segment| resolve_cmd_shim_path(shim_dir, segment))
+            .unwrap_or_else(|| PathBuf::from("node"));
+
+        if !command_path_available(&node_path) || !cli_path.is_file() {
+            return None;
+        }
 
         Some((node_path, cli_path))
     })?;
-
-    if !node_path.is_file() || !cli_path.is_file() {
-        return None;
-    }
 
     Some((node_path, cli_path, node_path_value))
 }
@@ -2901,6 +3003,26 @@ fn default_pi_command(working_directory: Option<&str>) -> CommandBuilder {
     command
 }
 
+fn describe_pi_command() -> String {
+    #[cfg(windows)]
+    {
+        if let Some(shim_path) = find_pi_cmd_shim() {
+            if parse_pi_cmd_shim(&shim_path).is_some() {
+                format!("node cli from {}", shim_path.display())
+            } else {
+                format!("cmd.exe /D /C pi (unparsed shim {})", shim_path.display())
+            }
+        } else {
+            "cmd.exe /D /C pi (no pi shim found in PATH)".to_string()
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        "sh -lc 'exec pi \"$@\"'".to_string()
+    }
+}
+
 fn default_shell_command(working_directory: Option<&str>) -> CommandBuilder {
     #[cfg(windows)]
     let mut command = {
@@ -2919,6 +3041,7 @@ fn default_shell_command(working_directory: Option<&str>) -> CommandBuilder {
     command
 }
 fn emit_start_error(app: &AppHandle, id: u64, error: String) {
+    append_diagnostic_log(app, "pty", format!("session {id} start error: {error}"));
     if let Ok(mut sessions) = app.state::<PtyState>().sessions.lock() {
         sessions.remove(&id);
     }
@@ -3021,6 +3144,37 @@ fn kill_running_session_sync(session: PtySession) {
     }
 }
 
+fn finish_running_session_sync(session: PtySession) -> Result<Option<PtyExitStatus>, String> {
+    if let PtySession::Running {
+        master,
+        writer,
+        mut child,
+        ..
+    } = session
+    {
+        let process_id = child.process_id();
+
+        drop(writer);
+        drop(master);
+
+        match child
+            .try_wait()
+            .map_err(|error| format!("unable to poll terminal process: {error}"))?
+        {
+            Some(status) => Ok(Some(status)),
+            None => {
+                kill_process_tree(process_id);
+                let _ = child.kill();
+                child
+                    .wait()
+                    .map(Some)
+                    .map_err(|error| format!("unable to wait for terminal process: {error}"))
+            }
+        }
+    } else {
+        Ok(None)
+    }
+}
 fn session_pi_profile_id(session: &PtySession) -> Option<String> {
     match session {
         PtySession::Running { pi_profile_id, .. } => pi_profile_id.clone(),
@@ -3132,9 +3286,21 @@ fn wait_for_child_output(mut child: StdChild, timeout: Duration) -> Result<(Outp
 }
 
 fn run_pi_package_command(
+    app: &AppHandle,
     profile: &PiLaunchProfile,
     args: &[String],
 ) -> Result<PiCommandOutput, String> {
+    let display = format!("pi {}", args.join(" "));
+    append_diagnostic_log(
+        app,
+        "pi-package",
+        format!(
+            "running `{display}` in {} with session dir {}",
+            profile.profile_dir.display(),
+            profile.session_dir.display()
+        ),
+    );
+
     let mut command = pi_process_command();
     command
         .args(args)
@@ -3152,15 +3318,35 @@ fn run_pi_package_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let child = command
-        .spawn()
-        .map_err(|error| format!("unable to run pi {}: {error}", args.join(" ")))?;
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            append_diagnostic_log(
+                app,
+                "pi-package",
+                format!("unable to run `{display}`: {error}"),
+            );
+            return Err(format!("unable to run {display}: {error}"));
+        }
+    };
     let (output, timed_out) = wait_for_child_output(child, PI_PACKAGE_COMMAND_TIMEOUT)?;
     let result = PiCommandOutput {
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         code: output.status.code(),
     };
+
+    append_diagnostic_log(
+        app,
+        "pi-package",
+        format!(
+            "`{display}` completed timed_out={timed_out} success={} code={:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.success(),
+            result.code,
+            result.stdout.trim(),
+            result.stderr.trim()
+        ),
+    );
 
     if timed_out {
         let mut message = format!(
@@ -3323,7 +3509,7 @@ fn run_pnpm_command(
 }
 
 #[cfg(windows)]
-fn run_pi_self_update_fallback() -> Result<(), String> {
+fn run_pi_self_update_fallback(app: &AppHandle) -> Result<(), String> {
     let package_name = pi_package_name_from_cmd_shim().ok_or_else(|| {
         "unable to inspect the current Pi pnpm shim for package-manager fallback update".to_string()
     })?;
@@ -3333,6 +3519,15 @@ fn run_pi_self_update_fallback() -> Result<(), String> {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir);
+
+    append_diagnostic_log(
+        app,
+        "pi-update",
+        format!(
+            "starting pnpm fallback self-update for {package_name} using {}",
+            pnpm_shim.display()
+        ),
+    );
 
     let version_output = run_pnpm_command(
         &pnpm_shim,
@@ -3344,6 +3539,12 @@ fn run_pi_self_update_fallback() -> Result<(), String> {
         &current_dir,
     )?;
     let latest_version = parse_package_version_output(&version_output)?;
+    append_diagnostic_log(
+        app,
+        "pi-update",
+        format!("pnpm fallback resolved latest {package_name} version {latest_version}"),
+    );
+
     let package_spec = format!("{package_name}@{latest_version}");
     let mut add_args = vec!["add".to_string(), "-g".to_string(), package_spec];
 
@@ -3354,11 +3555,22 @@ fn run_pi_self_update_fallback() -> Result<(), String> {
         add_args.push(global_bin_dir.to_string_lossy().to_string());
     }
 
-    run_pnpm_command(&pnpm_shim, &add_args, &current_dir).map(|_| ())
+    let install_output = run_pnpm_command(&pnpm_shim, &add_args, &current_dir)?;
+    append_diagnostic_log(
+        app,
+        "pi-update",
+        format!(
+            "pnpm fallback self-update completed code={:?}\nstdout:\n{}\nstderr:\n{}",
+            install_output.code,
+            install_output.stdout.trim(),
+            install_output.stderr.trim()
+        ),
+    );
+    Ok(())
 }
 
 #[cfg(not(windows))]
-fn run_pi_self_update_fallback() -> Result<(), String> {
+fn run_pi_self_update_fallback(_app: &AppHandle) -> Result<(), String> {
     Err("no package-manager fallback is available for this platform".to_string())
 }
 
@@ -3407,19 +3619,31 @@ fn with_startup_pi_update_lock<T>(
 
 fn run_startup_pi_self_update(app: &AppHandle) -> Result<(), String> {
     with_startup_pi_update_lock(app, || {
+        append_diagnostic_log(app, "pi-update", "starting automatic Pi self-update");
         let shared_addons = prepare_shared_addons_for_package_command(app)?;
         let args = ["update".to_string(), "--self".to_string()];
-        match run_pi_package_command(&shared_addons, &args) {
-            Ok(_) => Ok(()),
-            Err(pi_update_error) => run_pi_self_update_fallback().map_err(|fallback_error| {
-                format!(
-                    "pi update --self failed:\n{pi_update_error}\n\nPackage-manager fallback update failed:\n{fallback_error}"
-                )
-            }),
+        match run_pi_package_command(app, &shared_addons, &args) {
+            Ok(_) => {
+                append_diagnostic_log(app, "pi-update", "automatic `pi update --self` completed");
+                Ok(())
+            }
+            Err(pi_update_error) => {
+                append_diagnostic_log(
+                    app,
+                    "pi-update",
+                    format!(
+                        "automatic `pi update --self` failed; trying package-manager fallback\n{pi_update_error}"
+                    ),
+                );
+                run_pi_self_update_fallback(app).map_err(|fallback_error| {
+                    format!(
+                        "pi update --self failed:\n{pi_update_error}\n\nPackage-manager fallback update failed:\n{fallback_error}"
+                    )
+                })
+            }
         }
     })
 }
-
 fn ensure_startup_pi_self_update(app: &AppHandle, state: &PtyState) -> Result<(), String> {
     loop {
         let mut status = state
@@ -3454,12 +3678,28 @@ fn ensure_startup_pi_self_update(app: &AppHandle, state: &PtyState) -> Result<()
 
 fn spawn_startup_pi_self_update(app: AppHandle) {
     thread::spawn(move || {
-        if let Err(error) = ensure_startup_pi_self_update(&app, &app.state::<PtyState>()) {
-            eprintln!("automatic Pi startup update failed: {error}");
+        append_diagnostic_log(
+            &app,
+            "pi-update",
+            "background automatic Pi self-update task started",
+        );
+        match ensure_startup_pi_self_update(&app, &app.state::<PtyState>()) {
+            Ok(()) => append_diagnostic_log(
+                &app,
+                "pi-update",
+                "background automatic Pi self-update task finished",
+            ),
+            Err(error) => {
+                append_diagnostic_log(
+                    &app,
+                    "pi-update",
+                    format!("background automatic Pi self-update task failed: {error}"),
+                );
+                eprintln!("automatic Pi startup update failed: {error}");
+            }
         }
     });
 }
-
 fn strip_pi_package_command_prefix(value: &str) -> &str {
     let mut rest = value.trim();
     let lower = rest.to_ascii_lowercase();
@@ -3630,7 +3870,7 @@ async fn pi_addons_package_command(
         }
 
         let shared_addons = prepare_shared_addons_for_package_command(&app)?;
-        let output = run_pi_package_command(&shared_addons, &args)?;
+        let output = run_pi_package_command(&app, &shared_addons, &args)?;
         if command_name != "list" {
             rewrite_profile_settings_for_all_profiles(&app)?;
         }
@@ -3727,6 +3967,34 @@ fn pi_profile_resources_list(
 ) -> Result<HashMap<String, Vec<String>>, String> {
     let profile_id = profile_id.trim().to_string();
     list_profile_resource_entries(&app, &profile_id)
+}
+
+#[tauri::command]
+fn pioc_diagnostic_log_path(app: AppHandle) -> Result<String, String> {
+    diagnostic_log_path(&app).map(|path| path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn pioc_diagnostic_log_open(app: AppHandle) -> Result<String, String> {
+    let path = diagnostic_log_path(&app)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("unable to create diagnostics log directory: {error}"))?;
+    }
+    if !path.exists() {
+        fs::write(&path, b"").map_err(|error| {
+            format!(
+                "unable to create diagnostics log {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+
+    let path_text = path.to_string_lossy().to_string();
+    app.opener()
+        .open_path(path_text.clone(), None::<String>)
+        .map_err(|error| format!("unable to open diagnostics log: {error}"))?;
+    Ok(path_text)
 }
 
 fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -3849,8 +4117,16 @@ fn pty_start(
     let kind = match mode.as_deref().unwrap_or("pi") {
         "pi" => PtyKind::Pi,
         "shell" => PtyKind::Shell,
-        other => return Err(format!("unsupported terminal mode: {other}")),
+        other => {
+            append_diagnostic_log(
+                &app,
+                "pty",
+                format!("session {id} rejected unsupported terminal mode: {other}"),
+            );
+            return Err(format!("unsupported terminal mode: {other}"));
+        }
     };
+    let kind_label = kind.as_str();
     let working_directory = working_directory
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
@@ -3858,12 +4134,34 @@ fn pty_start(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
+    append_diagnostic_log(
+        &app,
+        "pty",
+        format!(
+            "session {id} start requested kind={kind_label} size={cols}x{rows} cwd={} profile={}",
+            working_directory.as_deref().unwrap_or("<default>"),
+            pi_profile_id.as_deref().unwrap_or("<default>")
+        ),
+    );
+
     if let Some(profile_id) = pi_profile_id.as_deref() {
-        validate_profile_id(profile_id)?;
+        if let Err(error) = validate_profile_id(profile_id) {
+            append_diagnostic_log(
+                &app,
+                "pty",
+                format!("session {id} rejected invalid profile id {profile_id}: {error}"),
+            );
+            return Err(error);
+        }
     }
 
     if let Some(cwd) = working_directory.as_deref() {
         if !PathBuf::from(cwd).is_dir() {
+            append_diagnostic_log(
+                &app,
+                "pty",
+                format!("session {id} rejected missing working directory: {cwd}"),
+            );
             return Err(format!("working directory does not exist: {cwd}"));
         }
     }
@@ -3875,6 +4173,7 @@ fn pty_start(
             .map_err(|_| "terminal session state is unavailable".to_string())?;
 
         if sessions.contains_key(&id) {
+            append_diagnostic_log(&app, "pty", format!("session {id} already exists"));
             return Err(format!("terminal session {id} already exists"));
         }
 
@@ -3882,12 +4181,29 @@ fn pty_start(
     }
 
     thread::spawn(move || {
+        append_diagnostic_log(
+            &app,
+            "pty",
+            format!("session {id} start thread entered kind={}", kind.as_str()),
+        );
+
         if matches!(kind, PtyKind::Pi) {
-            if let Err(error) = ensure_startup_pi_self_update(&app, &app.state::<PtyState>()) {
-                emit_start_error(&app, id, error);
-                return;
+            match ensure_startup_pi_self_update(&app, &app.state::<PtyState>()) {
+                Ok(()) => append_diagnostic_log(
+                    &app,
+                    "pi-update",
+                    format!("session {id} observed Pi startup self-update ready"),
+                ),
+                Err(error) => append_diagnostic_log(
+                    &app,
+                    "pi-update",
+                    format!(
+                        "session {id} continuing with installed Pi after startup self-update failure:\n{error}"
+                    ),
+                ),
             }
         }
+
         let pty_system = native_pty_system();
         let pair = match pty_system.openpty(PtySize {
             rows,
@@ -3914,6 +4230,16 @@ fn pty_start(
                         emit_start_error(&app, id, error);
                         return;
                     }
+                    append_diagnostic_log(
+                        &app,
+                        "pty",
+                        format!(
+                            "session {id} prepared Pi profile {} profile_dir={} session_dir={}",
+                            profile.id,
+                            profile.profile_dir.display(),
+                            profile.session_dir.display()
+                        ),
+                    );
                     Some(profile)
                 }
                 Err(error) => {
@@ -3925,6 +4251,10 @@ fn pty_start(
             None
         };
 
+        let command_description = match kind {
+            PtyKind::Pi => describe_pi_command(),
+            PtyKind::Shell => "default shell".to_string(),
+        };
         let mut command = match kind {
             PtyKind::Pi => default_pi_command(working_directory.as_deref()),
             PtyKind::Shell => default_shell_command(working_directory.as_deref()),
@@ -3983,7 +4313,34 @@ fn pty_start(
                 "PIOC_COMMAND_PATH",
                 control_paths.command_path.to_string_lossy().to_string(),
             );
+
+            append_diagnostic_log(
+                &app,
+                "pty",
+                format!(
+                    "session {id} configured PIOC extensions telemetry={} command={} control_extension={} hashline_extension={}",
+                    control_paths.telemetry_path.display(),
+                    control_paths.command_path.display(),
+                    control_extension_path.display(),
+                    hashline_extension_path.display()
+                ),
+            );
         }
+
+        append_diagnostic_log(
+            &app,
+            "pty",
+            format!(
+                "session {id} spawning kind={} command={} cwd={} profile={}",
+                kind.as_str(),
+                command_description,
+                working_directory.as_deref().unwrap_or("<default>"),
+                launch_profile
+                    .as_ref()
+                    .map(|profile| profile.id.as_str())
+                    .unwrap_or("<none>")
+            ),
+        );
 
         let child = match pair.slave.spawn_command(command) {
             Ok(child) => child,
@@ -3995,6 +4352,13 @@ fn pty_start(
                 return;
             }
         };
+        let process_id = child.process_id();
+        append_diagnostic_log(
+            &app,
+            "pty",
+            format!("session {id} spawned process pid={process_id:?}"),
+        );
+
         let mut reader = match pair.master.try_clone_reader() {
             Ok(reader) => reader,
             Err(error) => {
@@ -4032,6 +4396,11 @@ fn pty_start(
         };
 
         if !should_continue {
+            append_diagnostic_log(
+                &app,
+                "pty",
+                format!("session {id} was removed before ready; cleaning up spawned process"),
+            );
             if let Some(session) = session {
                 kill_running_session_sync(session);
             }
@@ -4043,18 +4412,24 @@ fn pty_start(
         }
 
         let _ = app.emit("pty:ready", PtyReadyPayload { id });
+        append_diagnostic_log(&app, "pty", format!("session {id} emitted ready"));
 
         let mut buffer = [0_u8; 8192];
-        loop {
+        let end_reason = loop {
             match reader.read(&mut buffer) {
-                Ok(0) => break,
+                Ok(0) => break "pty reader reached EOF".to_string(),
                 Ok(count) => {
                     let data = String::from_utf8_lossy(&buffer[..count]).to_string();
                     let _ = app.emit("pty:data", PtyDataPayload { id, data });
                 }
-                Err(_) => break,
+                Err(error) => break format!("pty reader failed: {error}"),
             }
-        }
+        };
+        append_diagnostic_log(
+            &app,
+            "pty",
+            format!("session {id} ended read loop: {end_reason}"),
+        );
 
         let removed_session = app
             .state::<PtyState>()
@@ -4064,18 +4439,51 @@ fn pty_start(
             .and_then(|mut sessions| sessions.remove(&id));
 
         if let Some(session) = removed_session {
-            kill_running_session_sync(session);
+            match finish_running_session_sync(session) {
+                Ok(Some(status)) => append_diagnostic_log(
+                    &app,
+                    "pty",
+                    format!(
+                        "session {id} process finished success={} code={} signal={:?}",
+                        status.success(),
+                        status.exit_code(),
+                        status.signal()
+                    ),
+                ),
+                Ok(None) => append_diagnostic_log(
+                    &app,
+                    "pty",
+                    format!("session {id} had no running process to finish"),
+                ),
+                Err(error) => append_diagnostic_log(
+                    &app,
+                    "pty",
+                    format!("session {id} failed while finishing process: {error}"),
+                ),
+            }
+        } else {
+            append_diagnostic_log(
+                &app,
+                "pty",
+                format!("session {id} had no session state during exit cleanup"),
+            );
         }
 
         if let Some(profile) = launch_profile.as_ref() {
             if let Err(error) =
                 sync_profile_auth_after_exit(&app, &app.state::<PtyState>(), &profile.id)
             {
+                append_diagnostic_log(
+                    &app,
+                    "pty",
+                    format!("session {id} auth sync failed after exit: {error}"),
+                );
                 let _ = app.emit("pty:error", PtyErrorPayload { id, error });
             }
         }
 
         let _ = app.emit("pty:exit", PtyExitPayload { id });
+        append_diagnostic_log(&app, "pty", format!("session {id} emitted exit"));
     });
 
     Ok(())
@@ -4127,6 +4535,7 @@ fn pty_resize(state: State<'_, PtyState>, id: u64, cols: u16, rows: u16) -> Resu
 
 #[tauri::command]
 fn pty_kill(app: AppHandle, state: State<'_, PtyState>, id: u64) -> Result<(), String> {
+    append_diagnostic_log(&app, "pty", format!("session {id} kill requested"));
     let session = {
         let mut sessions = state
             .sessions
@@ -4137,7 +4546,14 @@ fn pty_kill(app: AppHandle, state: State<'_, PtyState>, id: u64) -> Result<(), S
     };
 
     if let Some(session) = session {
+        append_diagnostic_log(&app, "pty", format!("session {id} removed for kill"));
         kill_running_session_background(app, session);
+    } else {
+        append_diagnostic_log(
+            &app,
+            "pty",
+            format!("session {id} kill requested but no session was present"),
+        );
     }
 
     Ok(())
@@ -4152,7 +4568,9 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
-            spawn_startup_pi_self_update(app.handle().clone());
+            let handle = app.handle().clone();
+            append_diagnostic_log(&handle, "app", "PIOC application started");
+            spawn_startup_pi_self_update(handle);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -4162,6 +4580,8 @@ pub fn run() {
             pi_profile_reveal_dir,
             pi_profile_reveal_resource_dir,
             pi_profile_resources_list,
+            pioc_diagnostic_log_path,
+            pioc_diagnostic_log_open,
             pi_addons_list,
             pi_addons_package_command,
             pi_addons_set_global_packages,
